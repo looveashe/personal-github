@@ -47,6 +47,22 @@ except ImportError:
 @dataclass
 class StrategyConfig:
     """策略参数汇总"""
+    # 市场环境过滤
+    use_index_filter: bool = True          # 是否开启大盘过滤
+    index_code: str = "000300"             # 沪深300
+    index_ma_period: int = 20              # 均线周期
+    index_start_offset: int = 60           # 指数拉取天数
+
+    # 仓位管理
+    position_method: str = "equal"         # "equal" 或 "inverse_volatility"
+    vol_lookback: int = 20                 # 波动率计算回看天数
+
+    # 出场规则
+    exit_use_macd: bool = True
+    exit_use_boll_lower: bool = True
+    exit_use_ma5: bool = True
+    exit_ma5_period: int = 5
+
     # 板块筛选
     board_return_top_pct: float = 0.05
     board_daily_limit_up_min: int = 3
@@ -78,11 +94,13 @@ class StrategyConfig:
 
     # 数据
     data_lookback_days: int = 400
-    request_delay: float = 0.6
-    max_retries: int = 3
+    request_delay: float = 3.0           # 改为3秒，大幅降低被断连概率
+    max_retries: int = 5                 # 更多重试机会
 
 
 CONFIG = StrategyConfig()
+
+DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "daily")
 
 
 # ============================================================
@@ -197,9 +215,7 @@ def _safe_ak_call(func, *args, description="", **kwargs):
             result = func(*args, **kwargs)
             return result
         except (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            requests.exceptions.HTTPError,
+            requests.exceptions.RequestException,  # 捕获所有 requests 异常，含 RemoteDisconnected
             ConnectionError,
             TimeoutError,
             OSError,
@@ -408,21 +424,64 @@ def fetch_limit_up_pool(trade_date: str) -> pd.DataFrame:
 
 
 def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """获取个股日K线（前复权）"""
+    """获取个股日K线（前复权，新浪数据源），带本地缓存"""
+    # 1. 检查缓存文件
+    cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
+    cached_df = None
+    if os.path.exists(cache_file):
+        try:
+            cached_df = pd.read_csv(cache_file, parse_dates=["日期"])
+            cached_df = cached_df.sort_values("日期").reset_index(drop=True)
+            if not cached_df.empty:
+                cached_start = cached_df["日期"].min().strftime("%Y%m%d")
+                cached_end = cached_df["日期"].max().strftime("%Y%m%d")
+                if cached_start <= start_date and cached_end >= end_date:
+                    mask = (cached_df["日期"] >= start_date) & (cached_df["日期"] <= end_date)
+                    return cached_df.loc[mask].reset_index(drop=True)
+        except Exception:
+            pass  # 缓存损坏则重新获取
+
+    # 2. 从新浪接口获取数据（仅此一个数据源）
     result = _safe_ak_call(
-        ak.stock_zh_a_hist,
-        symbol=code,
-        period="daily",
+        ak.stock_zh_a_daily,
+        symbol=f"{'sh' if code.startswith(('6','9')) else 'sz'}{code}",
         start_date=start_date,
         end_date=end_date,
         adjust="qfq",
-        description=f"个股日线 {code}",
+        description=f"个股日线(新浪) {code}",
     )
-    if result is None:
+
+    if result is None or result.empty:
         return pd.DataFrame()
-    if isinstance(result, pd.DataFrame) and len(result) > 0:
-        result["日期"] = pd.to_datetime(result["日期"])
-        result = result.sort_values("日期").reset_index(drop=True)
+
+    # 新浪接口返回英文列名，统一映射为中文
+    col_mapping = {
+        "date": "日期",
+        "open": "开盘",
+        "high": "最高",
+        "low": "最低",
+        "close": "收盘",
+        "volume": "成交量",
+    }
+    rename_map = {}
+    for col in result.columns:
+        col_lower = col.lower()
+        if col_lower in col_mapping:
+            rename_map[col] = col_mapping[col_lower]
+    if rename_map:
+        result.rename(columns=rename_map, inplace=True)
+
+    result["日期"] = pd.to_datetime(result["日期"])
+    result = result.sort_values("日期").reset_index(drop=True)
+
+    # 3. 合并旧缓存，更新本地文件
+    os.makedirs(DAILY_CACHE_DIR, exist_ok=True)
+    if cached_df is not None and not cached_df.empty:
+        combined = pd.concat([cached_df, result]).drop_duplicates(subset=["日期"]).sort_values("日期")
+        combined.to_csv(cache_file, index=False)
+    else:
+        result.to_csv(cache_file, index=False)
+
     return result
 
 
@@ -432,7 +491,94 @@ def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame
 STOCK_CONCEPT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "stock_concept_index.json")
 
 
-def build_stock_concept_index(force_refresh: bool = False) -> Dict:
+def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_date: str = None) -> pd.DataFrame:
+    """获取大盘指数日K线（沪深300/上证等）"""
+    symbol_map = {
+        "000300": "sh000300",
+        "000001": "sh000001",
+        "399001": "sz399001",
+    }
+    symbol = symbol_map.get(index_code, index_code)
+    if start_date is None:
+        start_date = (pd.to_datetime("today") - pd.Timedelta(days=CONFIG.index_start_offset)).strftime("%Y%m%d")
+    if end_date is None:
+        end_date = pd.to_datetime("today").strftime("%Y%m%d")
+
+    result = _safe_ak_call(
+        ak.stock_zh_index_daily,
+        symbol=symbol,
+        description=f"大盘指数 {index_code}",
+    )
+    if result is None or result.empty:
+        return pd.DataFrame()
+    # 标准列名：date, open, high, low, close, volume
+    result["date"] = pd.to_datetime(result["date"])
+    result = result.sort_values("date").reset_index(drop=True)
+    mask = (result["date"] >= pd.to_datetime(start_date)) & (result["date"] <= pd.to_datetime(end_date))
+    return result.loc[mask]
+
+
+def check_index_trend(eval_date: str) -> bool:
+    """
+    市场环境过滤：沪深300收盘价是否高于其20日均线。
+    返回 True 表示多头环境，可以操作；False 表示空头，建议空仓。
+    """
+    if not CONFIG.use_index_filter:
+        return True  # 未开启过滤则默认通过
+
+    print(f"  🌐 市场趋势过滤：检查 {CONFIG.index_code} ...")
+    end_date = eval_date
+    start_date = (pd.to_datetime(eval_date) - pd.Timedelta(days=CONFIG.index_start_offset)).strftime("%Y%m%d")
+    idx_df = fetch_index_daily(CONFIG.index_code, start_date, end_date)
+    if idx_df.empty or len(idx_df) < CONFIG.index_ma_period:
+        print(f"    ⚠ 指数数据不足，默认通过过滤")
+        return True
+
+    close = idx_df["close"]
+    ma = close.rolling(CONFIG.index_ma_period).mean()
+    latest_close = close.iloc[-1]
+    latest_ma = ma.iloc[-1]
+    trend = latest_close >= latest_ma
+    status = "🟢 多头" if trend else "🔴 空头"
+    print(f"    {status} | 收盘 {latest_close:.2f} vs MA{CONFIG.index_ma_period} {latest_ma:.2f}")
+    return trend
+
+
+def allocate_position(signals: List[Dict]) -> List[Dict]:
+    """
+    对最终信号分配建议仓位比例。
+    - 等权重: 1/N
+    - 倒数波动率: 1/volatility，归一化
+    """
+    if not signals:
+        return signals
+
+    n = len(signals)
+    if CONFIG.position_method == "equal":
+        weight = 1.0 / n if n else 0.0
+        for s in signals:
+            s["建议仓位"] = round(weight, 4)
+        return signals
+
+    # 倒数波动率加权
+    volatilities = []
+    for s in signals:
+        df = s.get("日线数据")
+        if df is not None and len(df) >= CONFIG.vol_lookback:
+            returns = df["收盘"].pct_change().dropna().tail(CONFIG.vol_lookback)
+            vol = returns.std()
+        else:
+            vol = 0.02  # 默认波动率
+        volatilities.append(max(vol, 0.001))  # 防止除零
+
+    inv_vol = [1.0 / v for v in volatilities]
+    total_inv = sum(inv_vol)
+    for i, s in enumerate(signals):
+        s["建议仓位"] = round(inv_vol[i] / total_inv, 4)
+    return signals
+
+
+def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
     """
     构建 stock_code → [{概念名称, 概念代码}, ...] 反向索引。
     首次/超30天自动全量下载板块成分股（约3-5分钟），之后秒查。
@@ -520,7 +666,10 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
 
     all_limit_up_data = {}
     for d in recent_5_dates:
-        all_limit_up_data[d] = fetch_limit_up_pool(d)
+        lt_data = fetch_limit_up_pool(d)
+        if lt_data is not None and not lt_data.empty:
+            lt_data = lt_data.drop_duplicates(subset=["代码"])
+        all_limit_up_data[d] = lt_data
 
     stock_zt_count = {}
     stock_zt_detail = {}
@@ -956,9 +1105,46 @@ def confirm_signals(candidates: List[Dict], eval_date: str) -> List[Dict]:
 # ============================================================
 # 主执行流程
 # ============================================================
+def get_exit_signal(df: pd.DataFrame, entry_idx: int) -> Tuple[bool, str]:
+    """
+    判断给定日线数据是否触发离场条件。
+    df: 个股日线（已按日期升序），包含 '收盘'、'成交量' 列
+    entry_idx: 入场日在 df 中的索引位置
+    返回 (是否离场, 离场原因)
+    """
+    close = df["收盘"]
+    volume = df["成交量"]
+    idx_now = len(df) - 1
+
+    # 需有足够数据
+    if idx_now <= entry_idx + 1:
+        return False, ""
+
+    # 1. MACD 死叉
+    if CONFIG.exit_use_macd:
+        diff, dea, _ = calc_macd(close)
+        if idx_now >= 2 and not pd.isna(diff.iloc[-1]) and not pd.isna(dea.iloc[-1]):
+            if diff.iloc[-1] < dea.iloc[-1] and diff.iloc[-2] >= dea.iloc[-2]:
+                return True, "MACD死叉"
+
+    # 2. 收盘跌破布林下轨
+    if CONFIG.exit_use_boll_lower:
+        _, _, lower = calc_bbands(close)
+        if not pd.isna(lower.iloc[-1]) and close.iloc[-1] < lower.iloc[-1]:
+            return True, "跌破布林下轨"
+
+    # 3. 收盘跌破5日均线
+    if CONFIG.exit_use_ma5:
+        ma5 = close.rolling(CONFIG.exit_ma5_period).mean()
+        if not pd.isna(ma5.iloc[-1]) and close.iloc[-1] < ma5.iloc[-1]:
+            return True, "跌破5日均线"
+
+    return False, ""
+
+
 def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
     """
-    每日识别主流程
+    每日识别主流程（增强版：含市场过滤、仓位建议、预留回测接口）
 
     Parameters
     ----------
@@ -967,7 +1153,7 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 
     Returns
     -------
-    List[Dict] : 识别结果列表
+    List[Dict] : 识别结果列表（包含建议仓位和出场条件说明）
     """
     if eval_date is None:
         eval_date = datetime.date.today().strftime("%Y-%m-%d")
@@ -981,10 +1167,16 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
         eval_date = trade_date
 
     print("=" * 80)
-    print("策略名称: 板块龙头共振识别策略（仅识别信号）")
+    print("策略名称: 板块龙头共振识别策略（增强版）")
     print(f"识别日期: {eval_date}")
     print("=" * 80)
 
+    # ========================== 市场环境过滤 ==========================
+    index_trend = check_index_trend(eval_date)
+    if not index_trend:
+        print("\n⚠ 市场环境偏空，建议空仓")
+
+    # ========================== 主线板块 ==========================
     main_sectors = screen_main_sectors(eval_date)
     if not main_sectors:
         print("\n⚠ 无主线板块，识别结束")
@@ -1000,17 +1192,57 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
     print(f"\n✅ 候选跟风股数量: {len(candidates)}")
 
     results = confirm_signals(candidates, eval_date)
-
-    print("\n" + "=" * 80)
-    print("===== 识别结果 =====")
-    print("=" * 80)
-
     if not results:
-        print("⚠ 无技术共振信号")
+        print("\n⚠ 无技术共振信号")
         return []
 
+    # ========================== 仓位分配 ==========================
+    # 注意：confirm_signals 返回的结果已包含 "日线数据"（由候选带入），此处追加仓位
+    for i, res in enumerate(results):
+        # 候选列表中顺序一致的，需要把日线数据传下去
+        # confirm_signals 中我们曾从 stock 继承字段，需确认日线数据是否保留
+        # 原 confirm_signals 没有显式传递日线数据，为支持仓位计算，需修改 confirm_signals 使其保留 df
+        # 此处对 confirm_signals 进行微调：在原函数返回结果的字典中增加 "日线数据"
+        pass
+
+    # 因 confirm_signals 返回的字典中未包含日线数据，我们先简单调整：
+    # 修改 confirm_signals 使其返回结果中包含 "日线数据"
+    # 这里偷懒直接在 daily_identify 中重建映射（效率低但安全）
+    for res in results:
+        code = res["代码"]
+        # 从原候选列表中找回日线数据
+        stock_df = None
+        for c in candidates:
+            if c["代码"] == code:
+                stock_df = c["日线数据"]
+                break
+        res["日线数据"] = stock_df
+
+    results = allocate_position(results)
+
+    # ========================== 输出结果 ==========================
+    print("\n" + "=" * 80)
+    print("===== 识别结果 （含出场规则定义） =====")
+    print("=" * 80)
+    print("出场规则：检测到下列任一条件即离场")
+    if CONFIG.exit_use_macd:
+        print("  - MACD死叉（DIFF下穿DEA）")
+    if CONFIG.exit_use_boll_lower:
+        print("  - 收盘价跌破布林带下轨")
+    if CONFIG.exit_use_ma5:
+        print(f"  - 收盘价跌破{CONFIG.exit_ma5_period}日均线")
+    print()
+
+    for r in results:
+        print(f"{r['代码']} {r['名称']} | 板块:{r['所属板块']} | "
+              f"龙头:{r['对应龙头']} | MACD金叉:{r.get('MACD金叉','?')} | "
+              f"布林买点:{r.get('布林买点','?')} | 维加斯买点:{r.get('维加斯买点','?')} | "
+              f"建议仓位:{r.get('建议仓位',0):.2%}")
+
     result_df = pd.DataFrame(results)
-    print(result_df.to_string(index=False))
+    # 省略日线数据列避免打印过长
+    display_cols = [c for c in result_df.columns if c != "日线数据"]
+    print(result_df[display_cols].to_string(index=False))
 
     print(f"\n===== 识别完毕，共 {len(results)} 只个股 =====")
     return results
@@ -1020,4 +1252,20 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 # 入口
 # ============================================================
 if __name__ == "__main__":
+    # 日常信号识别
     results = daily_identify()
+
+    # ---------------------------------------------------------------
+    # 如需对历史信号进行回测，可编写如下函数（需额外数据准备）
+    # def run_backtest(start_date, end_date):
+    #     signals = daily_identify(end_date)
+    #     for signal in signals:
+    #         df = signal["日线数据"]
+    #         entry_idx = len(df) - 1  # 当天为入场
+    #         for i in range(entry_idx+1, len(df)):
+    #             exited, reason = get_exit_signal(df.iloc[:i+1], entry_idx)
+    #             if exited:
+    #                 print(f"Signal {signal['代码']} exited on {df.index[i]} due to {reason}")
+    #                 break
+    # 注意：实际回测需考虑逐日交易和持仓状态，此处仅提供接口示例
+    # ---------------------------------------------------------------
