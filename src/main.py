@@ -17,6 +17,7 @@ import os
 import sys
 import io
 import warnings
+import re
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -61,7 +62,22 @@ class StrategyConfig:
     exit_use_macd: bool = True
     exit_use_boll_lower: bool = True
     exit_use_ma5: bool = True
-    exit_ma5_period: int = 5
+    exit_ma5_period: int = 5  # 保留作为默认，实际由下面参数覆盖
+
+    # 差异化出场：龙头用较长均线，跟风股用较短均线
+    leader_exit_ma_period: int = 10       # 龙头10日均线
+    follower_exit_ma_period: int = 5      # 跟风股5日均线
+
+    # 龙头断板联动止损
+    leader_break_exit_enabled: bool = True
+
+    # 移动止盈（盈利 > threshold 触发，回撤 > drawdown 止盈）
+    trailing_profit_threshold: float = 0.15   # 盈利15%以上
+    trailing_drawdown_limit: float = 0.08     # 从最高点回撤8%止盈
+
+    # 成分股活跃度预过滤（日均成交额、换手率）
+    min_daily_amount: float = 5e7             # 5000万
+    min_daily_turnover: float = 0.01          # 1%
 
     # 板块筛选
     board_return_top_pct: float = 0.05
@@ -70,13 +86,13 @@ class StrategyConfig:
     top_sectors_count: int = 2
 
     # 跟风股筛选
-    corr_threshold: float = 0.7
+    corr_threshold: float = 0.8
     corr_lookback: int = 60
-    follower_change_threshold: float = 0.05
+    follower_change_threshold: float = 0.08
     follower_volume_ratio: float = 1.5
     high_price_distance: float = 0.15
     high_price_lookback: int = 63
-    market_cap_limit: float = 10000
+    market_cap_limit: float = 500
 
     # MACD
     macd_fast: int = 12
@@ -95,12 +111,22 @@ class StrategyConfig:
     # 数据
     data_lookback_days: int = 400
     request_delay: float = 3.0           # 改为3秒，大幅降低被断连概率
-    max_retries: int = 5                 # 更多重试机会
+    max_retries: int = 5                # 更多重试机会
+
+    # 板块拥挤度过滤
+    board_crowding_limit_ratio: float = 0.30      # 当日涨停成分股占比上限
+    min_active_starters: int = 3                   # 未封板但已明显启动的最少标的数
+    active_starter_min_rise: float = 0.05          # 明显启动的最低近3日涨幅
+
+    # 筹码安全垫（前期涨幅上限）
+    pre_event_days: int = 20
+    pre_event_max_gain: float = 0.20
 
 
 CONFIG = StrategyConfig()
 
 DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "daily")
+BOARD_DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "board_daily")
 
 
 # ============================================================
@@ -203,10 +229,10 @@ def get_latest_trade_date(date_str: str) -> str:
 # ============================================================
 # 数据获取函数（带重试机制 + 指数退避）
 # ============================================================
-def _safe_ak_call(func, *args, description="", **kwargs):
+def _safe_ak_call(func, *args, description="", silent=False, **kwargs):
     """
     带指数退避重试的 akshare 请求包装器。
-    处理 ConnectionError、超时等网络异常。
+    silent=True 时，非网络错误不打印（用于非关键数据，如板块指数）。
     """
     last_error = None
     for attempt in range(1, CONFIG.max_retries + 1):
@@ -215,7 +241,7 @@ def _safe_ak_call(func, *args, description="", **kwargs):
             result = func(*args, **kwargs)
             return result
         except (
-            requests.exceptions.RequestException,  # 捕获所有 requests 异常，含 RemoteDisconnected
+            requests.exceptions.RequestException,
             ConnectionError,
             TimeoutError,
             OSError,
@@ -232,7 +258,8 @@ def _safe_ak_call(func, *args, description="", **kwargs):
 
     if last_error:
         desc = f" ({description})" if description else ""
-        print(f"    ❌ 请求失败{desc}: {last_error}")
+        if not silent:
+            print(f"    ❌ 请求失败{desc}: {last_error}")
     return None
 
 
@@ -277,6 +304,7 @@ def fetch_board_index(board_code: str, start_date: str, end_date: str) -> pd.Dat
         start_date=start_date,
         end_date=end_date,
         description=f"板块指数 {board_code}",
+        silent=True,   # 板块指数拉取失败是常见情况（某些板块无历史数据），静默处理
     )
     if result is None:
         return pd.DataFrame()
@@ -491,6 +519,42 @@ def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame
 STOCK_CONCEPT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "stock_concept_index.json")
 
 
+def _invert_stock_concept_index() -> Dict[str, set]:
+    """
+    从本地缓存 stock_concept_index.json 反转为 board_code→constituent_codes 映射。
+    若缓存不存在或为空，返回空字典。
+    """
+    import json
+    if not os.path.exists(STOCK_CONCEPT_CACHE):
+        return {}
+    with open(STOCK_CONCEPT_CACHE, "r", encoding="utf-8") as f:
+        stock_concept = json.load(f)
+    board_map: Dict[str, set] = {}
+    for stock_code, concepts in stock_concept.items():
+        for c in concepts:
+            board_code = c["概念代码"]
+            if board_code not in board_map:
+                board_map[board_code] = set()
+            board_map[board_code].add(stock_code)
+    return board_map
+
+
+def _read_stock_3d_ret(code: str, cache_dir: str = DAILY_CACHE_DIR) -> Optional[float]:
+    """从本地缓存读取股票近3个交易日涨幅"""
+    cache_file = os.path.join(cache_dir, f"{code}.csv")
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        df = pd.read_csv(cache_file, parse_dates=["日期"])
+        if df.empty or len(df) < 4:
+            return None
+        close_col = "收盘价" if "收盘价" in df.columns else "收盘"
+        closes = df[close_col].values
+        return (closes[-1] - closes[-4]) / closes[-4]
+    except Exception:
+        return None
+
+
 def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_date: str = None) -> pd.DataFrame:
     """获取大盘指数日K线（沪深300/上证等）"""
     symbol_map = {
@@ -542,6 +606,57 @@ def check_index_trend(eval_date: str) -> bool:
     status = "🟢 多头" if trend else "🔴 空头"
     print(f"    {status} | 收盘 {latest_close:.2f} vs MA{CONFIG.index_ma_period} {latest_ma:.2f}")
     return trend
+
+
+def allocate_position_hierarchical(signals: List[Dict], sectors: List[Dict]) -> List[Dict]:
+    """
+    按主线S/A/B等级分层分配仓位。
+    signals 中每个元素需包含 '板块等级' 和 '日线数据'
+    """
+    if not signals:
+        return signals
+
+    # 等级基数权重
+    base_weights = {"S": 0.60, "A": 0.30, "B": 0.10}
+    groups = {"S": [], "A": [], "B": []}
+    for sig in signals:
+        level = sig.get("板块等级", "B")
+        groups[level].append(sig)
+
+    # 仅考虑实际有信号的等级，动态归一化基础权重
+    active_levels = [lvl for lvl in ("S", "A", "B") if groups[lvl]]
+    total_active_weight = sum(base_weights[lvl] for lvl in active_levels)
+    if total_active_weight == 0:
+        return signals
+
+    level_weights = {lvl: base_weights[lvl] / total_active_weight for lvl in active_levels}
+
+    # 各等级内部再使用等权或倒数波动率分配
+    for lvl in active_levels:
+        group_signals = groups[lvl]
+        n = len(group_signals)
+        if n == 0:
+            continue
+        if CONFIG.position_method == "equal":
+            weight_per_stock = level_weights[lvl] / n
+            for s in group_signals:
+                s["建议仓位"] = round(weight_per_stock, 4)
+        else:  # 倒数波动率
+            volatilities = []
+            for s in group_signals:
+                df = s.get("日线数据")
+                if df is not None and len(df) >= CONFIG.vol_lookback:
+                    ret = df["收盘"].pct_change().dropna().tail(CONFIG.vol_lookback)
+                    vol = ret.std()
+                else:
+                    vol = 0.02
+                volatilities.append(max(vol, 0.001))
+            inv_vol = [1.0/v for v in volatilities]
+            total_inv = sum(inv_vol)
+            for i, s in enumerate(group_signals):
+                s["建议仓位"] = round(level_weights[lvl] * inv_vol[i] / total_inv, 4)
+
+    return signals
 
 
 def allocate_position(signals: List[Dict]) -> List[Dict]:
@@ -668,7 +783,8 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     for d in recent_5_dates:
         lt_data = fetch_limit_up_pool(d)
         if lt_data is not None and not lt_data.empty:
-            lt_data = lt_data.drop_duplicates(subset=["代码"])
+            lt_data["日期"] = d
+            lt_data = lt_data.drop_duplicates(subset=["代码", "日期"])
         all_limit_up_data[d] = lt_data
 
     stock_zt_count = {}
@@ -761,25 +877,27 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     print(f"  有龙头的概念板块数量: {len(board_candidate_pool)}")
 
     # ----------------------------------------------------------------
-    # 第3步：计算板块近3日涨幅和日均涨停家数
+    # 第3步：计算板块近3日涨幅和日均涨停家数（基于成分股本地缓存，快速且不依赖失效接口）
     # ----------------------------------------------------------------
-    print("\n  [第3步] 计算板块近3日涨幅和日均涨停家数...")
-
-    start_d = (pd.to_datetime(eval_date) - pd.Timedelta(days=30)).strftime("%Y%m%d")
+    print("\n  [第3步] 计算板块近3日涨幅和日均涨停家数（基于成分股缓存）...")
 
     for board_name, board_info in board_candidate_pool.items():
         # --- 板块近3日涨幅 ---
-        board_idx = fetch_board_index(board_name, start_d, date_str)
-        if board_idx.empty or len(board_idx) < 4:
-            board_info["近3日涨幅"] = -999.0
-        else:
-            close_col = "收盘价" if "收盘价" in board_idx.columns else "收盘"
-            closes = board_idx[close_col].values
-            board_info["近3日涨幅"] = float((closes[-1] - closes[-4]) / closes[-4])
+        constituent_codes = board_info["成分股代码集"]
+        ret_3d = -999.0
+        if constituent_codes:
+            sample_codes = list(constituent_codes)[:5]
+            valid_rets = []
+            for code in sample_codes:
+                ret = _read_stock_3d_ret(code)
+                if ret is not None:
+                    valid_rets.append(ret)
+            if valid_rets:
+                ret_3d = float(np.mean(valid_rets))
+        board_info["近3日涨幅"] = ret_3d
 
         # --- 近3日每日涨停家数 ---
         daily_limit_count = []
-        constituent_codes = board_info["成分股代码集"]
         for d in recent_3_dates:
             lt_data = all_limit_up_data.get(d)
             if lt_data is not None and not lt_data.empty:
@@ -837,15 +955,186 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     qualified.sort(key=lambda x: x["排序分"], reverse=True)
     main_sectors = qualified[: CONFIG.top_sectors_count]
 
+    # 给每个主线板块设定优先级（S/A/B）
+    for s in main_sectors:
+        ldr = s["领涨龙头"]
+        lb = ldr.get("连板数", 0)
+        daily_limits = s.get("涨停家数列表", [])
+        is_increasing = (
+            len(daily_limits) >= 2 and all(
+                daily_limits[i] < daily_limits[i+1] for i in range(len(daily_limits)-1)
+            )
+        )
+        if lb >= 5 and is_increasing:
+            s["priority"] = "S"
+        elif lb >= 3:
+            s["priority"] = "A"
+        else:
+            s["priority"] = "B"
+
     print(f"\n  主线板块筛选结果 ({len(main_sectors)}个):")
     for s in main_sectors:
         ldr = s["领涨龙头"]
         print(f"    {s['板块名称']} | 涨幅:{s['近3日涨幅']:.2%} | "
               f"日均涨停:{s['日均涨停家数']:.1f} | "
               f"龙头:{ldr.get('名称','?')}({ldr.get('代码','?')}) "
-              f"涨停{ldr.get('涨停天数',0)}天 连板{ldr.get('连板数',0)}")
+              f"涨停{ldr.get('涨停天数',0)}天 连板{ldr.get('连板数',0)} | "
+              f"等级:{s['priority']}")
 
     return main_sectors
+
+
+# ============================================================
+# 新增：趋势型主线识别路径（无关龙头）
+# ============================================================
+def _fetch_board_index_cached(board_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """带缓存的板块指数日线拉取"""
+    import os
+    cache_file = os.path.join(BOARD_DAILY_CACHE_DIR, f"{board_code}.csv")
+    os.makedirs(BOARD_DAILY_CACHE_DIR, exist_ok=True)
+
+    # 尝试从缓存读取完整区间
+    if os.path.exists(cache_file):
+        try:
+            cached = pd.read_csv(cache_file, parse_dates=["日期"])
+            if not cached.empty:
+                cached_start = cached["日期"].min().strftime("%Y%m%d")
+                cached_end = cached["日期"].max().strftime("%Y%m%d")
+                if cached_start <= start_date and cached_end >= end_date:
+                    mask = (cached["日期"] >= start_date) & (cached["日期"] <= end_date)
+                    return cached.loc[mask].reset_index(drop=True)
+        except Exception:
+            pass
+
+    # 拉取并合并缓存
+    board_idx = fetch_board_index(board_code, start_date, end_date)
+    if board_idx.empty:
+        return board_idx
+
+    if os.path.exists(cache_file):
+        try:
+            old = pd.read_csv(cache_file, parse_dates=["日期"])
+            combined = pd.concat([old, board_idx]).drop_duplicates(subset=["日期"]).sort_values("日期")
+            combined.to_csv(cache_file, index=False)
+        except Exception:
+            board_idx.to_csv(cache_file, index=False)
+    else:
+        board_idx.to_csv(cache_file, index=False)
+
+    return board_idx
+
+
+def screen_trend_sectors(eval_date: str) -> List[Dict]:
+    """
+    趋势型主线识别（无龙头前置条件，纯本地缓存版本）。
+    1. 获取所有概念板块。
+    2. 板块3日涨幅：采样该板块最多5只成分股，直接读本地日线缓存计算均值（无网络请求）。
+    3. 板块日均涨停家数：基于全部成分股和涨停池（无网络请求）。
+    4. 截取涨幅前10%且日均涨停≥2的板块。
+    """
+    print("\n===== 趋势型主线识别（并行路径，仅用本地缓存） =====")
+    date_str = to_date_str(eval_date)
+    # 近3个交易日
+    recent_3_dates = get_trade_dates(eval_date, 10)[-3:]  # 最近3个交易日
+
+    # 获取所有概念板块列表
+    boards = fetch_board_list()
+    if boards.empty:
+        return []
+
+    # 准备涨停池数据
+    print("  获取近3日涨停池...")
+    all_limit_up_data = {}
+    for d in recent_3_dates:
+        lt = fetch_limit_up_pool(d)
+        if lt is not None and not lt.empty:
+            # 统一列名，避免不同数据源代码列不一致
+            rename_map = {}
+            for col in lt.columns:
+                col_lower = str(col).lower()
+                if col_lower in ("股票代码", "ts_code", "symbol") and "代码" not in lt.columns:
+                    rename_map[col] = "代码"
+            if rename_map:
+                lt = lt.rename(columns=rename_map)
+            all_limit_up_data[d] = lt.drop_duplicates(subset=["代码"])
+
+    # 板块成分股映射
+    board_constituents_map = _invert_stock_concept_index()
+    if not board_constituents_map:
+        print("  ⚠ 无成分股数据，趋势路径无法运行。请先执行每日构建缓存。")
+        return []
+
+    # 本地股票缓存目录（与 fetch_stock_daily 一致）
+    stock_cache_dir = DAILY_CACHE_DIR
+
+    print(f"  遍历 {len(boards)} 个板块计算涨幅与涨停数（仅本地缓存）...")
+    board_records = []
+    for idx, (_, row) in enumerate(boards.iterrows()):
+        board_name = row["概念名称"]
+        raw_code = str(row.get("概念代码", row.get("code", "")))
+        if "/" in raw_code:
+            board_code = raw_code.rstrip("/").split("/")[-1]
+        else:
+            board_code = raw_code
+
+        constituent_codes = board_constituents_map.get(board_code, set())
+        if not constituent_codes:
+            continue
+
+        # ---- 3日涨幅：采样最多5只成分股，从本地缓存读取 ----
+        sample_codes = list(constituent_codes)[:5]  # 只取前5只
+        stock_rets = []
+        for code in sample_codes:
+            ret = _read_stock_3d_ret(code)  # 全局函数
+            if ret is not None:
+                stock_rets.append(ret)
+        if len(stock_rets) == 0:
+            continue  # 所有样本都无本地缓存，跳过该板块
+        ret_3d = np.mean(stock_rets)
+
+        # ---- 日均涨停家数 ----
+        daily_limit_counts = []
+        for d in recent_3_dates:
+            lt_data = all_limit_up_data.get(d)
+            if lt_data is not None and not lt_data.empty:
+                lt_codes = set(lt_data["代码"].tolist())
+                daily_limit_counts.append(len(constituent_codes & lt_codes))
+            else:
+                daily_limit_counts.append(0)
+        avg_limit = np.mean(daily_limit_counts)
+
+        board_records.append({
+            "板块代码": board_code,
+            "板块名称": board_name,
+            "近3日涨幅": ret_3d,
+            "日均涨停家数": avg_limit,
+            "成分股代码集": constituent_codes,
+        })
+
+        if (idx + 1) % 50 == 0:
+            print(f"    {idx + 1}/{len(boards)} ...")
+
+    if not board_records:
+        return []
+
+    # 前10%涨幅阈值
+    returns = [b["近3日涨幅"] for b in board_records]
+    top_threshold = np.percentile(returns, 90)
+    print(f"  全市场板块近3日涨幅前10%阈值: {top_threshold:.4f}")
+
+    trend_sectors = [
+        b for b in board_records
+        if b["近3日涨幅"] >= top_threshold and b["日均涨停家数"] >= 2
+    ]
+    trend_sectors.sort(key=lambda x: x["近3日涨幅"], reverse=True)
+    for s in trend_sectors:
+        s["领涨龙头"] = {}
+        s["priority"] = "B"   # 趋势型默认 B 级
+
+    print(f"  趋势型主线板块数量: {len(trend_sectors)}")
+    for s in trend_sectors:
+        print(f"    {s['板块名称']} | 涨幅:{s['近3日涨幅']:.2%} | 日均涨停:{s['日均涨停家数']:.1f} | 等级:{s['priority']}")
+    return trend_sectors
 
 
 # ============================================================
@@ -867,35 +1156,50 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
     candidates = []
 
     for sector in main_sectors:
-        leader = sector["领涨龙头"]
-        leader_code = leader["代码"]
-        leader_name = leader["名称"]
+        leader = sector.get("领涨龙头", {})
+        leader_code = leader.get("代码", "")
+        leader_name = leader.get("名称", "")
         board_name = sector["板块名称"]
         constituent_codes = sector.get("成分股代码集", set())
 
-        print(f"\n  板块: {board_name}, 龙头: {leader_name}({leader_code})")
+        use_sector_as_leader = (not leader_code)  # trend-based path: no individual leader
+
+        print(f"\n  板块: {board_name}, 龙头: {leader_name if leader_name else '（无龙头，使用板块指数）'}"
+              f"{'(' + leader_code + ')' if leader_code else ''}")
         print(f"  成分股数量: {len(constituent_codes)}")
 
-        leader_df = fetch_stock_daily(leader_code, start_date, date_str)
-        if leader_df.empty or len(leader_df) < 60:
-            print(f"    ⚠ 龙头数据不足，跳过该板块")
-            continue
+        # Get proxy returns for correlation
+        if use_sector_as_leader:
+            sector_idx_df = _fetch_board_index_cached(sector["板块代码"], start_date, date_str)
+            if sector_idx_df.empty or len(sector_idx_df) < 60:
+                print(f"    ⚠ 板块指数数据不足，跳过该板块")
+                continue
+            sector_idx_df = sector_idx_df.set_index("日期")
+            close_col = "收盘价" if "收盘价" in sector_idx_df.columns else "收盘"
+            proxy_returns = sector_idx_df[close_col].pct_change().dropna()
+            # For trend sectors, use evaluation date as the reference “first limit-up” date
+            leader_first_zt_dt = pd.to_datetime(eval_date)
+            leader_lb = 1
+        else:
+            leader_df = fetch_stock_daily(leader_code, start_date, date_str)
+            if leader_df.empty or len(leader_df) < 60:
+                print(f"    ⚠ 龙头数据不足，跳过该板块")
+                continue
+            leader_df = leader_df.set_index("日期")
+            proxy_returns = leader_df["收盘"].pct_change().dropna()
 
-        leader_df = leader_df.set_index("日期")
-        leader_returns = leader_df["收盘"].pct_change().dropna()
+            leader_first_zt_date = leader["首次涨停日期"]
+            leader_lb = leader["连板数"]
+            if leader_lb > 1:
+                trade_dates_all = get_trade_dates(eval_date, 20)
+                try:
+                    idx = trade_dates_all.index(leader_first_zt_date)
+                    first_idx = max(0, idx - leader_lb + 1)
+                    leader_first_zt_date = trade_dates_all[first_idx]
+                except (ValueError, IndexError):
+                    pass
 
-        leader_first_zt_date = leader["首次涨停日期"]
-        leader_lb = leader["连板数"]
-        if leader_lb > 1:
-            trade_dates_all = get_trade_dates(eval_date, 20)
-            try:
-                idx = trade_dates_all.index(leader_first_zt_date)
-                first_idx = max(0, idx - leader_lb + 1)
-                leader_first_zt_date = trade_dates_all[first_idx]
-            except (ValueError, IndexError):
-                pass
-
-        leader_first_zt_dt = pd.to_datetime(leader_first_zt_date)
+            leader_first_zt_dt = pd.to_datetime(leader_first_zt_date)
 
         stock_count = 0
         matched_count = 0
@@ -907,15 +1211,36 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
             stock_df = fetch_stock_daily(code, start_date, date_str)
             if stock_df.empty or len(stock_df) < 60:
                 continue
+            # 价格列统一为“收盘”
+            if "收盘" not in stock_df.columns and "收盘价" in stock_df.columns:
+                stock_df.rename(columns={"收盘价": "收盘"}, inplace=True)
+            if "收盘" not in stock_df.columns:
+                continue
+
+            # 成分股活跃度预过滤：日均成交额、换手率
+            if "成交额" in stock_df.columns and "换手率" in stock_df.columns:
+                recent20 = stock_df.tail(20)
+                avg_amount = recent20["成交额"].mean()
+                avg_turnover = recent20["换手率"].mean()
+                if avg_amount < CONFIG.min_daily_amount or avg_turnover < CONFIG.min_daily_turnover:
+                    continue
 
             stock_df = stock_df.set_index("日期")
             stock_returns = stock_df["收盘"].pct_change().dropna()
 
-            common_idx = leader_returns.index.intersection(stock_returns.index)
-            if len(common_idx) < 30:
+            common_idx = proxy_returns.index.intersection(stock_returns.index)
+            if len(common_idx) < 20:
                 continue
 
-            corr = leader_returns.loc[common_idx].corr(stock_returns.loc[common_idx])
+            # ---- 事件型相关性：只统计龙头启动日之后 ----
+            post_mask = common_idx >= leader_first_zt_dt
+            if post_mask.sum() >= 5:
+                common_idx_post = common_idx[post_mask]
+                corr = proxy_returns.loc[common_idx_post].corr(
+                    stock_returns.loc[common_idx_post]
+                )
+            else:
+                corr = proxy_returns.loc[common_idx].corr(stock_returns.loc[common_idx])
             if pd.isna(corr) or corr < CONFIG.corr_threshold:
                 continue
 
@@ -957,6 +1282,18 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
 
             if market_cap > 0 and market_cap / 1e8 > CONFIG.market_cap_limit:
                 continue
+
+            # ---- 筹码安全垫：龙头启动前20日累计涨幅≤20% ----
+            pre_end = leader_first_zt_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            pre_start = pre_end - pd.Timedelta(days=CONFIG.pre_event_days + 5)  # 留缓冲
+            pre_cut = stock_df.loc[(stock_df.index < pre_end) & (stock_df.index >= pre_start)]
+            if len(pre_cut) >= 2:
+                # 取实际最后20个交易日
+                pre_cut = pre_cut.tail(CONFIG.pre_event_days)
+                if len(pre_cut) >= 2:
+                    pre_gain = (pre_cut["收盘"].iloc[-1] - pre_cut["收盘"].iloc[0]) / pre_cut["收盘"].iloc[0]
+                    if pre_gain > CONFIG.pre_event_max_gain:
+                        continue
 
             matched_count += 1
             stock_name = ""
@@ -1105,39 +1442,66 @@ def confirm_signals(candidates: List[Dict], eval_date: str) -> List[Dict]:
 # ============================================================
 # 主执行流程
 # ============================================================
-def get_exit_signal(df: pd.DataFrame, entry_idx: int) -> Tuple[bool, str]:
+def get_exit_signal(
+    df: pd.DataFrame,
+    entry_idx: int,
+    is_leader: bool = False,
+    leader_broken: bool = False,
+    entry_price: float = None,
+    highest_since_entry: float = None,
+) -> Tuple[bool, str]:
     """
-    判断给定日线数据是否触发离场条件。
-    df: 个股日线（已按日期升序），包含 '收盘'、'成交量' 列
-    entry_idx: 入场日在 df 中的索引位置
-    返回 (是否离场, 离场原因)
+    增强型离场判断，支持：
+    - 龙头/跟风股差异化均线出场
+    - 龙头断板联动止损
+    - 移动止盈（从最高点回撤过多离场）
+
+    Parameters
+    ----------
+    df : 个股日线（含'收盘','成交量'列）
+    entry_idx : 入场日在df中的索引
+    is_leader : 是否为主板领涨龙头，影响均线周期
+    leader_broken : 龙头是否发生了首次放量断板（仅当 is_leader=False 时生效）
+    entry_price : 入场价，用于计算盈利（移动止盈）
+    highest_since_entry : 入场后最高收盘价，用于移动止盈
     """
     close = df["收盘"]
-    volume = df["成交量"]
     idx_now = len(df) - 1
-
-    # 需有足够数据
     if idx_now <= entry_idx + 1:
         return False, ""
 
-    # 1. MACD 死叉
+    # 0. 龙头断板联动止损（对跟风股有效）
+    if CONFIG.leader_break_exit_enabled and leader_broken and not is_leader:
+        return True, "龙头断板联动止损"
+
+    # 1. 移动止盈：盈利超阈值，回撤过大立即止盈
+    if entry_price is not None and highest_since_entry is not None:
+        profit = (close.iloc[-1] - entry_price) / entry_price
+        if profit > CONFIG.trailing_profit_threshold:
+            drawdown = (highest_since_entry - close.iloc[-1]) / highest_since_entry
+            if drawdown > CONFIG.trailing_drawdown_limit:
+                return True, f"移动止盈（盈利{profit:.1%}, 回撤{drawdown:.1%})"
+
+    # 2. MACD 死叉
     if CONFIG.exit_use_macd:
         diff, dea, _ = calc_macd(close)
         if idx_now >= 2 and not pd.isna(diff.iloc[-1]) and not pd.isna(dea.iloc[-1]):
             if diff.iloc[-1] < dea.iloc[-1] and diff.iloc[-2] >= dea.iloc[-2]:
                 return True, "MACD死叉"
 
-    # 2. 收盘跌破布林下轨
+    # 3. 收盘跌破布林下轨
     if CONFIG.exit_use_boll_lower:
         _, _, lower = calc_bbands(close)
         if not pd.isna(lower.iloc[-1]) and close.iloc[-1] < lower.iloc[-1]:
             return True, "跌破布林下轨"
 
-    # 3. 收盘跌破5日均线
+    # 4. 均线过滤：龙头用长周期，跟风股用短周期
     if CONFIG.exit_use_ma5:
-        ma5 = close.rolling(CONFIG.exit_ma5_period).mean()
-        if not pd.isna(ma5.iloc[-1]) and close.iloc[-1] < ma5.iloc[-1]:
-            return True, "跌破5日均线"
+        ma_period = CONFIG.leader_exit_ma_period if is_leader else CONFIG.follower_exit_ma_period
+        ma = close.rolling(ma_period).mean()
+        if not pd.isna(ma.iloc[-1]) and close.iloc[-1] < ma.iloc[-1]:
+            label = f"跌破{ma_period}日均线"
+            return True, label
 
     return False, ""
 
@@ -1176,13 +1540,26 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
     if not index_trend:
         print("\n⚠ 市场环境偏空，建议空仓")
 
-    # ========================== 主线板块 ==========================
-    main_sectors = screen_main_sectors(eval_date)
+    # ========================== 主线板块（整合两条路径，去重保留最高优先级） ==========================
+    leader_sectors = screen_main_sectors(eval_date)   # 龙头路径（含 S/A 级）
+    trend_sectors = screen_trend_sectors(eval_date)   # 趋势路径（B 级）
+
+    # 按板块名称去重，保留最高优先级（S > A > B）
+    priority_order = {"S": 3, "A": 2, "B": 1}
+    merged = {}
+    for s in leader_sectors + trend_sectors:
+        name = s["板块名称"]
+        if name not in merged or priority_order.get(s.get("priority", "B"), 0) > priority_order.get(merged[name].get("priority", "B"), 0):
+            merged[name] = s
+    main_sectors = list(merged.values())
+
     if not main_sectors:
         print("\n⚠ 无主线板块，识别结束")
         return []
 
-    print(f"\n✅ 主线板块: {[s['板块名称'] for s in main_sectors]}")
+    print(f"\n✅ 合并后主线板块: {[s['板块名称'] for s in main_sectors]}")
+    for s in main_sectors:
+        print(f"    {s['板块名称']} 等级:{s.get('priority','B')}")
 
     candidates = screen_followers(main_sectors, eval_date)
     if not candidates:
@@ -1196,45 +1573,41 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
         print("\n⚠ 无技术共振信号")
         return []
 
-    # ========================== 仓位分配 ==========================
-    # 注意：confirm_signals 返回的结果已包含 "日线数据"（由候选带入），此处追加仓位
-    for i, res in enumerate(results):
-        # 候选列表中顺序一致的，需要把日线数据传下去
-        # confirm_signals 中我们曾从 stock 继承字段，需确认日线数据是否保留
-        # 原 confirm_signals 没有显式传递日线数据，为支持仓位计算，需修改 confirm_signals 使其保留 df
-        # 此处对 confirm_signals 进行微调：在原函数返回结果的字典中增加 "日线数据"
-        pass
-
-    # 因 confirm_signals 返回的字典中未包含日线数据，我们先简单调整：
-    # 修改 confirm_signals 使其返回结果中包含 "日线数据"
-    # 这里偷懒直接在 daily_identify 中重建映射（效率低但安全）
+    # ========================== 仓位分配（分层） ==========================
+    # 补齐日线数据（被 confirm_signals 丢弃）
     for res in results:
         code = res["代码"]
-        # 从原候选列表中找回日线数据
         stock_df = None
         for c in candidates:
             if c["代码"] == code:
                 stock_df = c["日线数据"]
                 break
         res["日线数据"] = stock_df
+        # 标记所属板块等级
+        for s in main_sectors:
+            if s["板块名称"] == res["所属板块"]:
+                res["板块等级"] = s.get("priority", "B")
+                break
 
-    results = allocate_position(results)
+    results = allocate_position_hierarchical(results, main_sectors)
 
     # ========================== 输出结果 ==========================
     print("\n" + "=" * 80)
     print("===== 识别结果 （含出场规则定义） =====")
     print("=" * 80)
-    print("出场规则：检测到下列任一条件即离场")
+    print("出场规则：")
+    print("  - 龙头断板联动止损")
+    print(f"  - 盈利>{CONFIG.trailing_profit_threshold:.0%}后，从最高点回撤>{CONFIG.trailing_drawdown_limit:.0%}触发移动止盈")
     if CONFIG.exit_use_macd:
         print("  - MACD死叉（DIFF下穿DEA）")
     if CONFIG.exit_use_boll_lower:
         print("  - 收盘价跌破布林带下轨")
     if CONFIG.exit_use_ma5:
-        print(f"  - 收盘价跌破{CONFIG.exit_ma5_period}日均线")
+        print(f"  - 跟风股跌破{CONFIG.follower_exit_ma_period}日均线，龙头跌破{CONFIG.leader_exit_ma_period}日均线")
     print()
 
     for r in results:
-        print(f"{r['代码']} {r['名称']} | 板块:{r['所属板块']} | "
+        print(f"{r['代码']} {r['名称']} | 板块:{r['所属板块']}({r.get('板块等级','B')}级) | "
               f"龙头:{r['对应龙头']} | MACD金叉:{r.get('MACD金叉','?')} | "
               f"布林买点:{r.get('布林买点','?')} | 维加斯买点:{r.get('维加斯买点','?')} | "
               f"建议仓位:{r.get('建议仓位',0):.2%}")
@@ -1252,20 +1625,4 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    # 日常信号识别
     results = daily_identify()
-
-    # ---------------------------------------------------------------
-    # 如需对历史信号进行回测，可编写如下函数（需额外数据准备）
-    # def run_backtest(start_date, end_date):
-    #     signals = daily_identify(end_date)
-    #     for signal in signals:
-    #         df = signal["日线数据"]
-    #         entry_idx = len(df) - 1  # 当天为入场
-    #         for i in range(entry_idx+1, len(df)):
-    #             exited, reason = get_exit_signal(df.iloc[:i+1], entry_idx)
-    #             if exited:
-    #                 print(f"Signal {signal['代码']} exited on {df.index[i]} due to {reason}")
-    #                 break
-    # 注意：实际回测需考虑逐日交易和持仓状态，此处仅提供接口示例
-    # ---------------------------------------------------------------
