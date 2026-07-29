@@ -1106,7 +1106,9 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
         constituent_codes = board_info["成分股代码集"]
         ret_3d = -999.0
         if constituent_codes:
-            sample_codes = list(constituent_codes)[:5]
+            # 仅采样沪深主板、中小板、创业板（剔除北交所92开头等无效代码）
+            filtered_codes = [c for c in constituent_codes if c[:2] in ('60', '00', '30')]
+            sample_codes = filtered_codes[:5]
             valid_rets = []
             for code in sample_codes:
                 ret = _read_stock_3d_ret(code, eval_date=date_str)
@@ -1302,7 +1304,9 @@ def screen_trend_sectors(eval_date: str) -> List[Dict]:
             continue
 
         # ---- 3日涨幅：采样最多5只成分股，从本地缓存读取 ----
-        sample_codes = list(constituent_codes)[:5]  # 只取前5只
+        # 过滤掉北交所等无效代码
+        filtered_codes = [c for c in constituent_codes if c[:2] in ('60', '00', '30')]
+        sample_codes = filtered_codes[:5]  # 只取前5只有效代码
         stock_rets = []
         for code in sample_codes:
             ret = _read_stock_3d_ret(code, eval_date=date_str)  # 全局函数
@@ -1447,6 +1451,8 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
         stock_count = 0
         matched_count = 0
         for code in constituent_codes:
+            if code[:2] not in ('60', '00', '30'):
+                continue   # 跳过北交所等非沪深股票
             if code == leader_code:
                 continue
             stock_count += 1
@@ -1867,8 +1873,8 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    # 多数据源初始化：可通过环境变量 TUSHARE_TOKEN 设置，或留空只用 akshare/Baostock
-    tushare_token = os.environ.get("TUSHARE_TOKEN", "")
+    # 多数据源初始化：直接填入你的 Tushare token（从官网个人主页获取）
+    tushare_token = "你的token"   # ← 填在这里，例如 "abc123..."
     if tushare_token:
         if init_tushare(tushare_token):
             print("✅ Tushare 已初始化")
