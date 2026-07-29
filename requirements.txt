@@ -53,3 +53,4 @@ whichcraft==0.6.1
 wrapt==1.16.0
 xlrd==2.0.2
 xmltodict==0.13.0
+tushare token set TUSHARE_TOKEN=b9dcf9759a297c0a8fef5cf8b73d7d09af50c31444c041c115ba66d7 python main.py

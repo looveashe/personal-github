@@ -27,6 +27,42 @@ import pandas as pd
 import requests
 import akshare as ak
 
+# ============================================================
+# 多数据源支持（Tushare / Baostock 作为备用或增强）
+# ============================================================
+try:
+    import tushare as ts
+    TUSHARE_AVAILABLE = True
+except ImportError:
+    TUSHARE_AVAILABLE = False
+    ts = None
+
+try:
+    import baostock as bs
+    BAOSTOCK_AVAILABLE = True
+except ImportError:
+    BAOSTOCK_AVAILABLE = False
+    bs = None
+
+TUSHARE_PRO = None
+_BS_LOGINED = False
+
+def init_tushare(token: str):
+    """初始化 Tushare Pro，需要用户提供 token"""
+    global TUSHARE_PRO
+    if TUSHARE_AVAILABLE and token:
+        ts.set_token(token)
+        TUSHARE_PRO = ts.pro()
+    return TUSHARE_PRO is not None
+
+def init_baostock():
+    """初始化 Baostock 登录"""
+    global _BS_LOGINED
+    if BAOSTOCK_AVAILABLE and not _BS_LOGINED:
+        bs.login()
+        _BS_LOGINED = True
+    return _BS_LOGINED
+
 warnings.filterwarnings('ignore')
 
 # ============================================================
@@ -84,6 +120,10 @@ class StrategyConfig:
     board_daily_limit_up_min: int = 3
     leader_consecutive_days: int = 3
     top_sectors_count: int = 2
+
+    # 趋势路径阈值
+    board_return_top_pct_trend: float = 0.20
+    board_daily_limit_up_min_trend: float = 1.5
 
     # 跟风股筛选
     corr_threshold: float = 0.8
@@ -277,12 +317,23 @@ def fetch_stock_pool() -> pd.DataFrame:
 
 
 def fetch_board_list() -> pd.DataFrame:
-    """获取同花顺概念板块列表"""
-    print("  获取概念板块列表...")
+    """获取概念板块列表，优先使用Tushare，失败则降级到akshare"""
+    # 尝试Tushare
+    if TUSHARE_PRO is not None:
+        try:
+            print("  使用Tushare获取概念板块列表...")
+            ts_concepts = TUSHARE_PRO.concept(src='THS')
+            if ts_concepts is not None and not ts_concepts.empty:
+                ts_concepts.rename(columns={'name': '概念名称', 'code': '概念代码'}, inplace=True)
+                print(f"  Tushare概念板块数量: {len(ts_concepts)}")
+                return ts_concepts[['概念名称', '概念代码']]
+        except Exception as e:
+            print(f"  Tushare概念列表获取失败: {e}，降级到akshare")
+    # fallback
+    print("  获取akshare概念板块列表...")
     df = _safe_ak_call(ak.stock_board_concept_name_ths, description="概念板块列表")
     if df is None:
         return pd.DataFrame()
-    # 统一列名：兼容中英文两种列名格式
     rename_map = {}
     for col in df.columns:
         col_lower = str(col).lower()
@@ -334,7 +385,33 @@ def _parse_html_tables(text: str) -> List[pd.DataFrame]:
 
 
 def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFrame:
-    """获取板块成分股（解析板块主页HTML表格，不走AJAX接口）"""
+    """
+    获取板块成分股，优先使用 Tushare，失败则降级到同花顺爬虫。
+    board_code: 概念板块代码（如 `300200`）
+    """
+    # ------ Tushare 优先 ------
+    if TUSHARE_PRO is not None:
+        try:
+            time.sleep(CONFIG.request_delay * 0.5)  # 适当的请求间隔
+            detail = TUSHARE_PRO.concept_detail(
+                concept_code=board_code,
+                fields='ts_code,name'
+            )
+            if detail is not None and not detail.empty:
+                if 'ts_code' not in detail.columns or 'name' not in detail.columns:
+                    raise ValueError("Tushare 返回格式异常")
+                detail['代码'] = detail['ts_code'].str[:6]
+                detail['名称'] = detail['name']
+                detail['板块代码'] = board_code
+                print(f"    ✅ Tushare 获取 {board_name or board_code} 成分股 {len(detail)} 只")
+                return detail[['代码', '名称', '板块代码']]
+            else:
+                # Tushare 返回空，尝试爬虫
+                print(f"    Tushare 返回空（{board_code}），尝试爬虫...")
+        except Exception as e:
+            print(f"    ⚠ Tushare 成分股获取失败 ({board_code}): {e}，尝试爬虫...")
+
+    # ------ 爬虫兜底（原逻辑，保持不变）------
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -353,27 +430,22 @@ def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFr
             resp = session.get(main_url, timeout=15)
             resp.raise_for_status()
 
-            # 主页用 utf-8，AJAX 分页用 gbk
             try:
                 text = resp.content.decode("gbk")
             except Exception:
                 text = resp.text
 
-            # 从主页 HTML 中找成分股表格（使用安全解析函数）
             dfs = _parse_html_tables(text)
             if not dfs:
                 return pd.DataFrame()
 
-            # 找到成分股表格（通常第一个含代码列的表格）
             found = False
             for df in dfs:
                 if df.empty or df.shape[1] < 3:
                     continue
-                # 检查第2列是否像股票代码（6位数字）
                 sample = str(df.iloc[:, 1].dropna().iloc[0]) if len(df) > 0 else ""
                 if not (sample.replace(" ", "").isdigit() and 5 <= len(sample.replace(" ", "")) <= 6):
                     continue
-
                 for _, row in df.iterrows():
                     code = str(row.iloc[1]).replace(" ", "").zfill(6)
                     name = str(row.iloc[2]).replace(" ", "")
@@ -385,7 +457,6 @@ def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFr
             if not found:
                 return pd.DataFrame()
 
-            # 如果主页只有第一页（通常50条），尝试翻页加载更多
             if len(all_records) >= 40:
                 for page in range(2, 30):
                     ajax_url = f"http://q.10jqka.com.cn/gn/detail/order/desc/page/{page}/ajax/1/code/{board_code}/"
@@ -419,7 +490,6 @@ def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFr
                             break
                     except Exception:
                         break
-
             break
         except Exception as e:
             if attempt < CONFIG.max_retries:
@@ -438,16 +508,33 @@ def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFr
 
 
 def fetch_limit_up_pool(trade_date: str) -> pd.DataFrame:
-    """获取某日涨停板数据"""
-    result = _safe_ak_call(
-        ak.stock_zt_pool_em,
-        date=trade_date,
-        description=f"涨停板 {trade_date}",
-    )
+    """获取某日涨停板数据（Tushare 优先，akshare 备用）"""
+    result = None
+    # Tushare 涨停数据
+    if TUSHARE_PRO is not None:
+        try:
+            # limit_list 接口：limit_type='U' 表示涨停
+            limit_df = TUSHARE_PRO.limit_list(trade_date=trade_date, limit_type='U')
+            if limit_df is not None and not limit_df.empty:
+                limit_df['代码'] = limit_df['ts_code'].str[:6]
+                limit_df['名称'] = limit_df['name']
+                limit_df['日期'] = trade_date
+                limit_df['连板数'] = limit_df.get('limit_times', 0)
+                result = limit_df[['代码','名称','日期','连板数']].copy()
+        except Exception as e:
+            print(f"    Tushare 涨停池 {trade_date} 失败: {e}，降级到 akshare")
+
+    # akshare 备用
     if result is None:
+        result = _safe_ak_call(
+            ak.stock_zt_pool_em,
+            date=trade_date,
+            description=f"涨停板 {trade_date}",
+        )
+        if result is not None and not result.empty:
+            result["日期"] = trade_date
+    if result is None or result.empty:
         return pd.DataFrame()
-    if isinstance(result, pd.DataFrame) and len(result) > 0:
-        result["日期"] = trade_date
     return result
 
 
@@ -469,35 +556,85 @@ def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame
         except Exception:
             pass  # 缓存损坏则重新获取
 
-    # 2. 从新浪接口获取数据（仅此一个数据源）
-    result = _safe_ak_call(
-        ak.stock_zh_a_daily,
-        symbol=f"{'sh' if code.startswith(('6','9')) else 'sz'}{code}",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq",
-        description=f"个股日线(新浪) {code}",
-    )
+    # 2. 多数据源获取（按优先级：Tushare → akshare → Baostock）
+    result = None
+
+    # 2.1 Tushare
+    if TUSHARE_PRO is not None:
+        try:
+            ts_code = f"{code}.{'SH' if code.startswith(('6','9')) else 'SZ'}"
+            # 使用 Tushare 前复权日线
+            ts_df = TUSHARE_PRO.daily(ts_code=ts_code, start_date=start_date, end_date=end_date,
+                                      adj='qfq', factors=False)
+            if ts_df is not None and not ts_df.empty:
+                ts_df.rename(columns={
+                    'trade_date': '日期',
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'close': '收盘',
+                    'vol': '成交量',
+                    'amount': '成交额',
+                    'turnover_rate': '换手率'
+                }, inplace=True)
+                ts_df['日期'] = pd.to_datetime(ts_df['日期'])
+                result = ts_df.sort_values('日期').reset_index(drop=True)
+        except Exception as e:
+            print(f"    Tushare 获取 {code} 失败: {e}，降级到 akshare")
+
+    # 2.2 akshare（新浪）
+    if result is None:
+        result = _safe_ak_call(
+            ak.stock_zh_a_daily,
+            symbol=f"{'sh' if code.startswith(('6','9')) else 'sz'}{code}",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+            description=f"个股日线(新浪) {code}",
+        )
+        if result is not None and not result.empty:
+            # 新浪接口返回英文列名，统一映射为中文
+            col_mapping = {
+                "date": "日期",
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "volume": "成交量",
+            }
+            rename_map = {}
+            for col in result.columns:
+                col_lower = col.lower()
+                if col_lower in col_mapping:
+                    rename_map[col] = col_mapping[col_lower]
+            if rename_map:
+                result.rename(columns=rename_map, inplace=True)
+
+    # 2.3 Baostock（作为最后备选）
+    if result is None and BAOSTOCK_AVAILABLE:
+        init_baostock()
+        try:
+            bs_code = f"{'sh' if code.startswith(('6','9')) else 'sz'}.{code}"
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,turn",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="2"  # 前复权
+            )
+            data_list = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+            if data_list:
+                bs_df = pd.DataFrame(data_list, columns=['日期','开盘','最高','最低','收盘','成交量','成交额','换手率'])
+                bs_df['日期'] = pd.to_datetime(bs_df['日期'])
+                for c in ['开盘','最高','最低','收盘','成交量','成交额','换手率']:
+                    bs_df[c] = pd.to_numeric(bs_df[c], errors='coerce')
+                result = bs_df
+        except Exception as e:
+            print(f"    Baostock 获取 {code} 失败: {e}")
 
     if result is None or result.empty:
         return pd.DataFrame()
-
-    # 新浪接口返回英文列名，统一映射为中文
-    col_mapping = {
-        "date": "日期",
-        "open": "开盘",
-        "high": "最高",
-        "low": "最低",
-        "close": "收盘",
-        "volume": "成交量",
-    }
-    rename_map = {}
-    for col in result.columns:
-        col_lower = col.lower()
-        if col_lower in col_mapping:
-            rename_map[col] = col_mapping[col_lower]
-    if rename_map:
-        result.rename(columns=rename_map, inplace=True)
 
     result["日期"] = pd.to_datetime(result["日期"])
     result = result.sort_values("日期").reset_index(drop=True)
@@ -539,9 +676,42 @@ def _invert_stock_concept_index() -> Dict[str, set]:
     return board_map
 
 
-def _read_stock_3d_ret(code: str, cache_dir: str = DAILY_CACHE_DIR) -> Optional[float]:
-    """从本地缓存读取股票近3个交易日涨幅"""
+def _get_stock_market_cap(code: str, date_str: str) -> Optional[float]:
+    """获取某只股票在某交易日的流通市值（单位：元）"""
+    # 优先 Tushare
+    if TUSHARE_PRO is not None:
+        try:
+            # daily_basic 可获取流通市值
+            df = TUSHARE_PRO.daily_basic(ts_code=f"{code}.{'SH' if code.startswith(('6','9')) else 'SZ'}",
+                                         trade_date=date_str.replace('-', ''),
+                                         fields='ts_code,trade_date,circ_mv')
+            if df is not None and not df.empty:
+                circ_mv = df['circ_mv'].iloc[0]
+                if circ_mv and not pd.isna(circ_mv):
+                    return float(circ_mv) * 1e4  # Tushare 流通市值单位是万元，转为元
+        except Exception as e:
+            pass
+    # akshare 备用
+    try:
+        spot = ak.stock_zh_a_spot_em()
+        if spot is not None and not spot.empty:
+            if '代码' in spot.columns and '流通市值' in spot.columns:
+                row = spot[spot['代码'] == code]
+                if not row.empty:
+                    return row['流通市值'].iloc[0]
+    except Exception:
+        pass
+    return None
+
+
+def _read_stock_3d_ret(code: str, cache_dir: str = DAILY_CACHE_DIR, eval_date: str = None) -> Optional[float]:
+    """从本地缓存读取股票近3个交易日涨幅；若缓存缺失且指定了eval_date则自动拉取"""
     cache_file = os.path.join(cache_dir, f"{code}.csv")
+    if not os.path.exists(cache_file) and eval_date is not None:
+        # 自动补拉最近100个交易日
+        end_dt = eval_date
+        start_dt = (pd.to_datetime(eval_date) - pd.Timedelta(days=100)).strftime("%Y%m%d")
+        fetch_stock_daily(code, start_dt, end_dt)
     if not os.path.exists(cache_file):
         return None
     try:
@@ -556,28 +726,78 @@ def _read_stock_3d_ret(code: str, cache_dir: str = DAILY_CACHE_DIR) -> Optional[
 
 
 def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """获取大盘指数日K线（沪深300/上证等）"""
-    symbol_map = {
-        "000300": "sh000300",
-        "000001": "sh000001",
-        "399001": "sz399001",
-    }
-    symbol = symbol_map.get(index_code, index_code)
+    """获取大盘指数日K线（Tushare 优先，akshare/Baostock 备用）"""
     if start_date is None:
         start_date = (pd.to_datetime("today") - pd.Timedelta(days=CONFIG.index_start_offset)).strftime("%Y%m%d")
     if end_date is None:
         end_date = pd.to_datetime("today").strftime("%Y%m%d")
 
-    result = _safe_ak_call(
-        ak.stock_zh_index_daily,
-        symbol=symbol,
-        description=f"大盘指数 {index_code}",
-    )
+    result = None
+
+    # Tushare 指数日线
+    if TUSHARE_PRO is not None:
+        try:
+            # 映射指数代码到 Tushare 的指数代码（如 000300.SH）
+            ts_index_map = {
+                "000300": "000300.SH",
+                "000001": "000001.SH",
+                "399001": "399001.SZ",
+            }
+            ts_code = ts_index_map.get(index_code, f"{index_code}.SH" if index_code.startswith(('0','3')) else f"{index_code}.SZ")
+            ts_df = TUSHARE_PRO.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            if ts_df is not None and not ts_df.empty:
+                ts_df.rename(columns={'trade_date':'date','close':'close'}, inplace=True)
+                ts_df['date'] = pd.to_datetime(ts_df['date'])
+                ts_df = ts_df.sort_values('date')
+                result = ts_df[['date','open','high','low','close','vol']]
+        except Exception as e:
+            print(f"    Tushare 指数数据 {index_code} 失败: {e}")
+
+    # akshare
+    if result is None:
+        symbol_map = {
+            "000300": "sh000300",
+            "000001": "sh000001",
+            "399001": "sz399001",
+        }
+        symbol = symbol_map.get(index_code, index_code)
+        ak_result = _safe_ak_call(
+            ak.stock_zh_index_daily,
+            symbol=symbol,
+            description=f"大盘指数 {index_code}",
+        )
+        if ak_result is not None and not ak_result.empty:
+            ak_result["date"] = pd.to_datetime(ak_result["date"])
+            result = ak_result.sort_values("date").reset_index(drop=True)
+
+    # Baostock
+    if result is None and BAOSTOCK_AVAILABLE:
+        init_baostock()
+        try:
+            bs_index_map = {
+                "000300": "sh.000300",
+                "000001": "sh.000001",
+                "399001": "sz.399001",
+            }
+            bs_code = bs_index_map.get(index_code, f"sh.{index_code}" if index_code.startswith(('0','3')) else f"sz.{index_code}")
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="2"
+            )
+            data_list = [rs.get_row_data() for _ in range(len(rs.get_data()))]
+            if data_list:
+                bs_df = pd.DataFrame(data_list, columns=['date','open','high','low','close','volume'])
+                bs_df['date'] = pd.to_datetime(bs_df['date'])
+                for c in ['open','high','low','close','volume']:
+                    bs_df[c] = pd.to_numeric(bs_df[c], errors='coerce')
+                result = bs_df
+        except Exception as e:
+            print(f"    Baostock 指数数据 {index_code} 失败: {e}")
+
     if result is None or result.empty:
         return pd.DataFrame()
-    # 标准列名：date, open, high, low, close, volume
-    result["date"] = pd.to_datetime(result["date"])
-    result = result.sort_values("date").reset_index(drop=True)
     mask = (result["date"] >= pd.to_datetime(start_date)) & (result["date"] <= pd.to_datetime(end_date))
     return result.loc[mask]
 
@@ -889,7 +1109,7 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
             sample_codes = list(constituent_codes)[:5]
             valid_rets = []
             for code in sample_codes:
-                ret = _read_stock_3d_ret(code)
+                ret = _read_stock_3d_ret(code, eval_date=date_str)
                 if ret is not None:
                     valid_rets.append(ret)
             if valid_rets:
@@ -1085,7 +1305,7 @@ def screen_trend_sectors(eval_date: str) -> List[Dict]:
         sample_codes = list(constituent_codes)[:5]  # 只取前5只
         stock_rets = []
         for code in sample_codes:
-            ret = _read_stock_3d_ret(code)  # 全局函数
+            ret = _read_stock_3d_ret(code, eval_date=date_str)  # 全局函数
             if ret is not None:
                 stock_rets.append(ret)
         if len(stock_rets) == 0:
@@ -1119,12 +1339,13 @@ def screen_trend_sectors(eval_date: str) -> List[Dict]:
 
     # 前10%涨幅阈值
     returns = [b["近3日涨幅"] for b in board_records]
-    top_threshold = np.percentile(returns, 90)
-    print(f"  全市场板块近3日涨幅前10%阈值: {top_threshold:.4f}")
+    pct = (1 - CONFIG.board_return_top_pct_trend) * 100
+    top_threshold = np.percentile(returns, pct)
+    print(f"  全市场板块近3日涨幅前{CONFIG.board_return_top_pct_trend*100:.0f}%阈值: {top_threshold:.4f}")
 
     trend_sectors = [
         b for b in board_records
-        if b["近3日涨幅"] >= top_threshold and b["日均涨停家数"] >= 2
+        if b["近3日涨幅"] >= top_threshold and b["日均涨停家数"] >= CONFIG.board_daily_limit_up_min_trend
     ]
     trend_sectors.sort(key=lambda x: x["近3日涨幅"], reverse=True)
     for s in trend_sectors:
@@ -1172,14 +1393,36 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
         if use_sector_as_leader:
             sector_idx_df = _fetch_board_index_cached(sector["板块代码"], start_date, date_str)
             if sector_idx_df.empty or len(sector_idx_df) < 60:
-                print(f"    ⚠ 板块指数数据不足，跳过该板块")
-                continue
-            sector_idx_df = sector_idx_df.set_index("日期")
-            close_col = "收盘价" if "收盘价" in sector_idx_df.columns else "收盘"
-            proxy_returns = sector_idx_df[close_col].pct_change().dropna()
-            # For trend sectors, use evaluation date as the reference “first limit-up” date
-            leader_first_zt_dt = pd.to_datetime(eval_date)
-            leader_lb = 1
+                # 板块指数不可用 → 用成分股合成平均收益率序列作为代理
+                print(f"    板块指数无数据，改用成分股合成代理...")
+                synth_returns = None
+                synth_codes = list(constituent_codes)[:5]  # 采样5只成分股
+                for scode in synth_codes:
+                    sdf = fetch_stock_daily(scode, start_date, date_str)
+                    if sdf.empty or len(sdf) < 60:
+                        continue
+                    sdf = sdf.set_index("日期")
+                    if "收盘" not in sdf.columns:
+                        continue
+                    ret_series = sdf["收盘"].pct_change().dropna()
+                    if synth_returns is None:
+                        synth_returns = ret_series
+                    else:
+                        common = synth_returns.index.intersection(ret_series.index)
+                        synth_returns = (synth_returns.loc[common] + ret_series.loc[common]) / 2.0  # 简单平均
+                if synth_returns is not None and len(synth_returns) >= 60:
+                    proxy_returns = synth_returns
+                    leader_first_zt_dt = pd.to_datetime(eval_date)
+                    leader_lb = 1
+                else:
+                    print(f"    ⚠ 合成代理数据仍不足，跳过该板块")
+                    continue
+            else:
+                sector_idx_df = sector_idx_df.set_index("日期")
+                close_col = "收盘价" if "收盘价" in sector_idx_df.columns else "收盘"
+                proxy_returns = sector_idx_df[close_col].pct_change().dropna()
+                leader_first_zt_dt = pd.to_datetime(eval_date)
+                leader_lb = 1
         else:
             leader_df = fetch_stock_daily(leader_code, start_date, date_str)
             if leader_df.empty or len(leader_df) < 60:
@@ -1244,28 +1487,33 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
             if pd.isna(corr) or corr < CONFIG.corr_threshold:
                 continue
 
-            if leader_first_zt_dt not in stock_df.index:
-                continue
-
-            zt_day_data = stock_df.loc[leader_first_zt_dt]
-            if isinstance(zt_day_data, pd.DataFrame):
-                zt_day_data = zt_day_data.iloc[0]
-
-            zt_day_change = zt_day_data.get("涨跌幅", 0)
-            if pd.isna(zt_day_change):
-                zt_day_change = 0
-            zt_day_change = zt_day_change / 100 if abs(zt_day_change) > 1 else zt_day_change
-
-            zt_day_volume = zt_day_data.get("成交量", 0)
-            avg_vol_20 = stock_df["成交量"].rolling(20).mean()
-            if leader_first_zt_dt in avg_vol_20.index:
-                vol_20 = avg_vol_20.loc[leader_first_zt_dt]
+            if use_sector_as_leader:
+                # 无龙头板块：跳过启动日异动检查，直接通过
+                zt_day_change = CONFIG.follower_change_threshold
+                vol_ratio = CONFIG.follower_volume_ratio
             else:
-                vol_20 = stock_df["成交量"].tail(20).mean()
-            vol_ratio = zt_day_volume / vol_20 if vol_20 > 0 else 0
+                if leader_first_zt_dt not in stock_df.index:
+                    continue
 
-            if not (zt_day_change >= CONFIG.follower_change_threshold or vol_ratio >= CONFIG.follower_volume_ratio):
-                continue
+                zt_day_data = stock_df.loc[leader_first_zt_dt]
+                if isinstance(zt_day_data, pd.DataFrame):
+                    zt_day_data = zt_day_data.iloc[0]
+
+                zt_day_change = zt_day_data.get("涨跌幅", 0)
+                if pd.isna(zt_day_change):
+                    zt_day_change = 0
+                zt_day_change = zt_day_change / 100 if abs(zt_day_change) > 1 else zt_day_change
+
+                zt_day_volume = zt_day_data.get("成交量", 0)
+                avg_vol_20 = stock_df["成交量"].rolling(20).mean()
+                if leader_first_zt_dt in avg_vol_20.index:
+                    vol_20 = avg_vol_20.loc[leader_first_zt_dt]
+                else:
+                    vol_20 = stock_df["成交量"].tail(20).mean()
+                vol_ratio = zt_day_volume / vol_20 if vol_20 > 0 else 0
+
+                if not (zt_day_change >= CONFIG.follower_change_threshold or vol_ratio >= CONFIG.follower_volume_ratio):
+                    continue
 
             recent_high = stock_df["最高"].tail(CONFIG.high_price_lookback).max()
             current_close = stock_df["收盘"].iloc[-1]
@@ -1273,14 +1521,8 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
             if high_distance >= CONFIG.high_price_distance:
                 continue
 
-            market_cap = 0
-            try:
-                if "流通市值" in stock_df.columns:
-                    market_cap = stock_df["流通市值"].iloc[-1]
-            except Exception:
-                pass
-
-            if market_cap > 0 and market_cap / 1e8 > CONFIG.market_cap_limit:
+            market_cap = _get_stock_market_cap(code, date_str)
+            if market_cap is not None and market_cap > 0 and (market_cap / 1e8) > CONFIG.market_cap_limit:
                 continue
 
             # ---- 筹码安全垫：龙头启动前20日累计涨幅≤20% ----
@@ -1625,4 +1867,12 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 # 入口
 # ============================================================
 if __name__ == "__main__":
+    # 多数据源初始化：可通过环境变量 TUSHARE_TOKEN 设置，或留空只用 akshare/Baostock
+    tushare_token = os.environ.get("TUSHARE_TOKEN", "")
+    if tushare_token:
+        if init_tushare(tushare_token):
+            print("✅ Tushare 已初始化")
+        else:
+            print("⚠ Tushare 初始化失败，将使用 akshare/Baostock")
+    # Baostock 会自动在需要时登录，无需提前调用
     results = daily_identify()
