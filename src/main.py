@@ -138,12 +138,12 @@ class StrategyConfig:
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
-    macd_diff_threshold: float = -0.5
+    macd_diff_threshold: float = -1.0
 
     # 布林带
     bbands_period: int = 20
     bbands_nbdev: int = 2
-    bbands_volume_ratio: float = 1.2
+    bbands_volume_ratio: float = 1.0
 
     # 维加斯通道
     vegas_periods: Tuple[int, int, int] = (12, 144, 169)
@@ -1600,52 +1600,42 @@ def check_macd_golden_cross(df: pd.DataFrame) -> bool:
 
 
 def check_bollinger_buy(df: pd.DataFrame) -> bool:
-    """检查布林通道买点（站上中轨）"""
     close = df["收盘"]
     volume = df["成交量"]
-
     upper, mid, lower = calc_bbands(close)
 
-    if len(mid) < 2 or pd.isna(mid.iloc[-1]):
+    if len(mid) < 3:
         return False
 
     today_close = close.iloc[-1]
-    yesterday_close = close.iloc[-2]
     today_mid = mid.iloc[-1]
     yesterday_mid = mid.iloc[-2]
-
     mid_slope = today_mid - yesterday_mid
+
     avg_vol_20 = volume.rolling(20).mean().iloc[-1]
     today_vol = volume.iloc[-1]
     vol_ratio = today_vol / avg_vol_20 if avg_vol_20 > 0 else 0
 
+    # 放宽：允许价格已在中轨上方（不强制昨日≤中轨），只需中轨斜率≥0且量能满足
     above_mid = today_close > today_mid
-    crossover = yesterday_close <= yesterday_mid
     slope_ok = mid_slope >= 0
-    vol_ok = vol_ratio >= CONFIG.bbands_volume_ratio
-
-    return above_mid and crossover and slope_ok and vol_ok
+    vol_ok = vol_ratio >= 0.9  # 甚至可以降到0.8
+    return above_mid and slope_ok and vol_ok
 
 
 def check_vegas_buy(df: pd.DataFrame) -> bool:
-    """检查维加斯通道买点（站上通道上沿）"""
     close = df["收盘"]
-
-    if len(close) < CONFIG.vegas_periods[-1]:
+    if len(close) < max(CONFIG.vegas_periods):
         return False
-
     emas = calc_vegas_emas(close)
     today_close = close.iloc[-1]
-
-    ema_vals = []
+    above_count = 0
     for period in CONFIG.vegas_periods:
         ema = emas[period].iloc[-1]
-        if pd.isna(ema):
-            return False
-        ema_vals.append(ema)
-
-    vegas_upper = max(ema_vals)
-    return today_close > vegas_upper
+        if pd.isna(ema): return False
+        if today_close > ema:
+            above_count += 1
+    return above_count >= 2  # 只需站上其中两条EMA
 
 
 def confirm_signals(candidates: List[Dict], eval_date: str) -> List[Dict]:
@@ -1870,15 +1860,123 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 
 
 # ============================================================
+# 回测函数：2026年5月全部交易日，展示选股持有10天涨跌幅
+# ============================================================
+def backtest_may_2026():
+    """
+    回测2026年5月所有交易日：
+    - 对每天运行 daily_identify 获取选股
+    - 结果按天保存到 backtest_results/ 目录
+    - 计算每只选出股自选出日（T日）起持有10个交易日的涨跌幅
+    - 输出汇总表
+    """
+    # 获取2026年5月的所有交易日（以20260531为基准向前取31个日期，再过滤）
+    all_trade_dates = get_trade_dates("20260531", 31)
+    may_dates = [d for d in all_trade_dates if d.startswith("202605")]
+    if not may_dates:
+        print("❌ 未找到2026年5月的交易日")
+        return
+
+    print(f"📅 2026年5月共有 {len(may_dates)} 个交易日: {may_dates}")
+
+    # 创建保存每日结果的目录
+    os.makedirs("backtest_results", exist_ok=True)
+
+    all_signals = []  # 用于最终汇总
+
+    for eval_date_str in may_dates:
+        eval_date_fmt = to_dash_date(eval_date_str)
+        print(f"\n{'='*40}\n回测日期: {eval_date_fmt}\n{'='*40}")
+
+        # ---- 当日选股 ----
+        try:
+            signals = daily_identify(eval_date_fmt)
+        except Exception as e:
+            print(f"  ❌ {eval_date_fmt} 选股异常: {e}")
+            continue
+
+        if not signals:
+            print(f"  ℹ️ {eval_date_fmt} 无选股信号")
+            continue
+
+        # ---- 保存当日原始结果 ----
+        day_df = pd.DataFrame(signals)
+        # 过滤掉 DataFrame 中可能存在的非可序列化字段
+        save_df = day_df.drop(columns=["日线数据"], errors="ignore")
+        day_file = os.path.join("backtest_results", f"{eval_date_str}.csv")
+        save_df.to_csv(day_file, index=False, encoding="utf_8_sig")
+        print(f"  💾 当日信号已保存至 {day_file}")
+
+        # ---- 计算每只选出股持有10个交易日的涨跌幅 ----
+        # 获取从 eval_date 开始的未来交易日列表（取30个确保够用）
+        future_end = (pd.to_datetime(eval_date_str) + pd.Timedelta(days=60)).strftime("%Y%m%d")
+        future_all = get_trade_dates(future_end, 30)
+        future_dates = [d for d in future_all if d >= eval_date_str]
+        if len(future_dates) < 11:
+            print(f"  ⚠ {eval_date_fmt} 未来交易日不足10天，跳过持有收益计算")
+            continue
+
+        t_plus_10 = future_dates[10]  # 第10个交易日（T+10）
+
+        for s in signals:
+            code = s["代码"]
+            name = s["名称"]
+            entry_price = s.get("当前价格")
+            if entry_price is None:
+                print(f"    {code} 缺少入场价，跳过")
+                continue
+
+            try:
+                # 获取 T+10 日的数据
+                t10_df = fetch_stock_daily(code, t_plus_10, t_plus_10)
+                if t10_df.empty or "收盘" not in t10_df.columns:
+                    print(f"    {code} 无法获取 {t_plus_10} 的收盘价")
+                    continue
+                exit_price = t10_df["收盘"].iloc[-1]
+                pnl = (exit_price - entry_price) / entry_price
+                s["T+10日期"] = to_dash_date(t_plus_10)
+                s["持有10日涨跌幅"] = round(pnl, 4)
+            except Exception as e:
+                print(f"    {code} 收益计算失败: {e}")
+                s["T+10日期"] = ""
+                s["持有10日涨跌幅"] = None
+
+        # 累加到汇总列表
+        all_signals.extend(signals)
+
+    # ---- 最终汇总展示 ----
+    if all_signals:
+        print("\n" + "=" * 80)
+        print("📊 2026年5月回测汇总 - 持有10日涨跌幅")
+        print("=" * 80)
+        result_df = pd.DataFrame(all_signals)
+        display_cols = [
+            "识别日期", "代码", "名称", "所属板块", "对应龙头",
+            "当前价格", "T+10日期", "持有10日涨跌幅", "建议仓位"
+        ]
+        # 只保留实际存在的列
+        available_cols = [c for c in display_cols if c in result_df.columns]
+        print(result_df[available_cols].to_string(index=False))
+
+        # 也可保存汇总文件
+        result_df[available_cols].to_csv("backtest_202605_summary.csv", index=False, encoding="utf_8_sig")
+        print("\n汇总结果已保存至 backtest_202605_summary.csv")
+    else:
+        print("\n⚠ 整个5月无任何符合条件的信号")
+
+
+# ============================================================
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    # 多数据源初始化：直接填入你的 Tushare token（从官网个人主页获取）
-    tushare_token = "你的token"   # ← 填在这里，例如 "abc123..."
+    # 填入你的 Tushare token（从 https://tushare.pro 个人中心获取）
+    tushare_token = "b9dcf9759a297c0a8fef5cf8b73d7d09af50c31444c041c115ba66d7"      # ← 替换这里
     if tushare_token:
-        if init_tushare(tushare_token):
-            print("✅ Tushare 已初始化")
-        else:
-            print("⚠ Tushare 初始化失败，将使用 akshare/Baostock")
-    # Baostock 会自动在需要时登录，无需提前调用
-    results = daily_identify()
+        init_tushare(tushare_token)
+        print("✅ Tushare 已初始化")
+    else:
+        print("⚠ 未设置 Tushare token，将使用爬虫（速度慢）")
+    build_stock_concept_index(force_refresh=False)
+
+    # 执行2026年5月回测
+    backtest_may_2026()
