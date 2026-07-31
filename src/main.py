@@ -180,6 +180,11 @@ _sector_rotation_history = []  # 记录最近3天的板块名称集合，用于�
 DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "daily")
 BOARD_DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "board_daily")
 
+# 独立缓存文件路径
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
+CONCEPT_INDEX_PATH = os.path.join(DATA_DIR, "stock_concept_index.json")
+INDUSTRY_SW_INDEX_PATH = os.path.join(DATA_DIR, "stock_industry_sw_index.json")
+
 
 # ============================================================
 # 技术指标函数（支持 talib / pandas 双模式）
@@ -354,11 +359,10 @@ def fetch_stock_pool() -> pd.DataFrame:
 
 def fetch_board_list() -> pd.DataFrame:
     """
-    获取板块列表（概念或行业）。
-    优先 Tushare 同花顺概念，失败则回退到 Tushare 申万2021行业分类。
-    不再使用东方财富接口。
+    获取板块列表（仅同花顺概念）。
+    申万三级行业由 build_industry_index_sw 单独构建并合入缓存。
     """
-    # 1. Tushare 同花顺概念（非东财）
+    # Tushare 同花顺概念
     if TUSHARE_PRO is not None:
         try:
             print("  使用Tushare获取同花顺概念板块列表...")
@@ -368,34 +372,34 @@ def fetch_board_list() -> pd.DataFrame:
                 print(f"  Tushare概念板块数量: {len(ts_concepts)}")
                 return ts_concepts[['概念名称', '概念代码']]
         except Exception as e:
-            print(f"  Tushare概念列表获取失败: {e}，尝试申万行业分类...")
+            print(f"  Tushare概念列表获取失败: {e}")
 
-    # 2. 东财行业分类（兜底）
-    try:
-        print("  尝试获取东方财富行业分类...")
-        import akshare as ak
-        em_industry = _safe_ak_call(ak.stock_board_industry_name_em, description="东财行业列表")
-        if em_industry is not None and not em_industry.empty:
-            # 统一列名
-            rename = {}
-            for col in em_industry.columns:
-                if 'code' in str(col).lower() and '概念代码' not in em_industry.columns:
-                    rename[col] = '概念代码'
-                if 'name' in str(col).lower() and '概念名称' not in em_industry.columns:
-                    rename[col] = '概念名称'
-            if rename:
-                em_industry.rename(columns=rename, inplace=True)
-            # 加前缀标记
-            if '概念名称' in em_industry.columns:
-                em_industry['概念名称'] = '行业-' + em_industry['概念名称'].astype(str)
-                print(f"  东财行业板块数量: {len(em_industry)}")
-                return em_industry[['概念名称', '概念代码']]
-    except Exception as e2:
-        print(f"  东财行业分类获取失败: {e2}")
-
-    print("  ❌ 无可用数据源获取板块列表，请检查 Tushare 及网络")
+    print("  ⚠ 同花顺概念板块获取失败（申万三级行业将在后续步骤单独构建）")
     return pd.DataFrame()
 
+
+def fetch_concept_constituents_ths(concept_code: str, concept_name: str = "") -> pd.DataFrame:
+    """
+    使用 akshare 获取同花顺概念成分股。
+    返回 DataFrame，列：['代码','名称','概念代码','概念名称']
+    """
+    try:
+        df = _safe_ak_call(
+            ak.stock_board_concept_cons_ths,
+            symbol=concept_code,
+            description=f"概念成分股 {concept_name or concept_code}",
+            silent=True
+        )
+        if df is not None and not df.empty:
+            # 列名统一
+            if '代码' in df.columns and '名称' in df.columns:
+                df = df[['代码', '名称']].copy()
+                df['概念代码'] = concept_code
+                df['概念名称'] = concept_name if concept_name else concept_code
+                return df[['代码', '名称', '概念代码', '概念名称']]
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 def fetch_board_index(board_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """获取板块指数K线（同花顺）"""
@@ -636,6 +640,25 @@ def _invert_stock_concept_index() -> Dict[str, set]:
             board_map[board_code].add(stock_code)
     return board_map
 
+
+def get_stock_concepts(code: str) -> List[Dict]:
+    """
+    获取某只股票的概念/行业标签，先查概念缓存，若不存在再查行业缓存。
+    """
+    # 尝试加载概念缓存
+    if os.path.exists(CONCEPT_INDEX_PATH):
+        with open(CONCEPT_INDEX_PATH, 'r', encoding='utf-8') as f:
+            concept_data = json.load(f)
+        if code in concept_data:
+            return concept_data[code]
+
+    # 尝试加载行业缓存
+    if os.path.exists(INDUSTRY_SW_INDEX_PATH):
+        with open(INDUSTRY_SW_INDEX_PATH, 'r', encoding='utf-8') as f:
+            industry_data = json.load(f)
+        return industry_data.get(code, [])
+
+    return []
 
 def _get_stock_market_cap(code: str, date_str: str) -> Optional[float]:
     """获取某只股票在某交易日的流通市值（单位：元）"""
@@ -958,25 +981,29 @@ def allocate_position(signals: List[Dict]) -> List[Dict]:
 
 def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
     """
-    构建 stock_code → [{概念名称, 概念代码}, ...] 反向索引。
-    首次/超30天自动全量下载板块成分股（约3-5分钟），之后秒查。
+    构建股票→概念反向索引（仅同花顺概念），写入独立缓存文件。
+    首次或超过30天自动全量更新。
     """
-    # ---- 检查缓存：30天内有效且非空 ----
-    if not force_refresh and os.path.exists(STOCK_CONCEPT_CACHE):
-        mtime = datetime.date.fromtimestamp(os.path.getmtime(STOCK_CONCEPT_CACHE))
-        if (datetime.date.today() - mtime).days < 30:
-            print(f"  ✓ 加载本地缓存 ({mtime}): data/stock_concept_index.json")
-            with open(STOCK_CONCEPT_CACHE, "r", encoding="utf-8") as f:
+    cache_path = CONCEPT_INDEX_PATH
+    # 检查是否需要刷新
+    need_update = force_refresh
+    if not need_update and os.path.exists(cache_path):
+        mtime = datetime.date.fromtimestamp(os.path.getmtime(cache_path))
+        if (datetime.date.today() - mtime).days >= 30:
+            need_update = True
+        else:
+            print(f"  ✓ 概念缓存有效 ({mtime})，直接加载")
+            with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             if cached:
                 return cached
-            print("  ⚠ 缓存为空，重新构建...")
+            need_update = True
 
-    print("  ⏳ 构建股票→概念反向索引（首次需下载全部板块成分股，约3-5分钟，30天仅一次）...")
-
-    boards = fetch_board_list()
-    if boards.empty:
-        return {}
+    if need_update:
+        print("  ⏳ 构建股票→概念反向索引（使用同花顺概念，月度更新）...")
+        boards = fetch_board_list()
+        if boards.empty:
+            return {}
 
     stock_concept_map = {}
     total = len(boards)
@@ -1015,14 +1042,28 @@ def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
     return stock_concept_map
 
 
-def build_industry_index_em():
+def build_industry_index_sw():
     """
-    构建申万三级行业索引，合并到现有概念缓存中。
-    使用 akshare 申万三级行业数据，确保龙头全覆盖。
+    构建申万三级行业索引，写入独立缓存文件。
+    首次或超过365天自动全量更新。
     """
-    print("===== 构建申万三级行业索引（合并至概念缓存）=====")
+    cache_path = INDUSTRY_SW_INDEX_PATH
+    need_update = False
+    if os.path.exists(cache_path):
+        mtime = datetime.date.fromtimestamp(os.path.getmtime(cache_path))
+        if (datetime.date.today() - mtime).days >= 365:
+            need_update = True
+        else:
+            print(f"  ✓ 行业缓存有效 ({mtime})，跳过更新")
+            return
+    else:
+        need_update = True
 
-    # 1. 获取行业板块列表
+    if not need_update:
+        return
+
+    print("===== 构建申万三级行业索引（写入独立缓存）=====")
+
     industry_boards = fetch_industry_list_sw()
     if industry_boards.empty:
         print("❌ 无法获取申万三级行业列表")
@@ -1030,21 +1071,13 @@ def build_industry_index_em():
 
     print(f"  申万三级行业板块数量: {len(industry_boards)}")
 
-    # 2. 加载已有概念缓存
-    cache_path = os.path.join(os.path.dirname(__file__), "..", "data", "stock_concept_index.json")
-    if os.path.exists(cache_path):
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            stock_concept_map = json.load(f)
-        print(f"  已加载现有概念缓存，包含 {len(stock_concept_map)} 只股票")
-    else:
-        stock_concept_map = {}
+    # 初始化行业字典
+    industry_map = {}
 
-    # 3. 遍历行业获取成分股
     total = len(industry_boards)
     for idx, (_, row) in enumerate(industry_boards.iterrows()):
         industry_name = row['概念名称']
         industry_code = row['概念代码']
-
         if (idx + 1) % 10 == 0 or idx == 0:
             print(f"    进度: {idx + 1}/{total} — {industry_name}")
 
@@ -1054,18 +1087,18 @@ def build_industry_index_em():
 
         for _, stock_row in const.iterrows():
             code = stock_row['代码']
-            if code not in stock_concept_map:
-                stock_concept_map[code] = []
-            if not any(c['概念代码'] == industry_code for c in stock_concept_map[code]):
-                stock_concept_map[code].append({
+            if code not in industry_map:
+                industry_map[code] = []
+            if not any(c['概念代码'] == industry_code for c in industry_map[code]):
+                industry_map[code].append({
                     "概念名称": industry_name,
                     "概念代码": industry_code,
                 })
 
-    # 4. 保存
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(stock_concept_map, f, ensure_ascii=False, indent=2)
-    print(f"✅ 行业索引已合并，总计覆盖 {len(stock_concept_map)} 只股票")
+        json.dump(industry_map, f, ensure_ascii=False, indent=2)
+    print(f"✅ 行业索引构建完成，覆盖 {len(industry_map)} 只股票")
 
 
 # ============================================================
@@ -2752,6 +2785,6 @@ if __name__ == "__main__":
     else:
         print("⚠ 未设置 Tushare token，将使用爬虫（速度慢）")
     # result = daily_identify()
-    build_industry_index_em()
+    build_industry_index_sw()
 
 
