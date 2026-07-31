@@ -2682,36 +2682,32 @@ def backtest_may_2026():
 
 def fetch_industry_list_sw() -> pd.DataFrame:
     """
-    获取申万三级行业列表，兼容多种 akshare 版本。
-    优先尝试 sw_index_third_info，其次 sw_index_third。
+    获取申万三级行业列表（使用 sw_index_third_info，返回中文列名 '行业代码'/'行业名称'）。
     """
     try:
-        import akshare as ak
+        df = ak.sw_index_third_info()
+        if df is not None and not df.empty:
+            # akshare 新版本返回中文列名：行业代码 / 行业名称
+            if '行业代码' in df.columns and '行业名称' in df.columns:
+                df = df.rename(columns={
+                    '行业代码': '概念代码',
+                    '行业名称': '概念名称'
+                })
+            elif 'industry_code' in df.columns and 'industry_name' in df.columns:
+                # 兼容旧版本英文列名
+                df = df.rename(columns={
+                    'industry_code': '概念代码',
+                    'industry_name': '概念名称'
+                })
+            else:
+                print("  sw_index_third_info 返回的列名不符合预期，请升级 akshare。")
+                print("  实际列名:", df.columns.tolist())
+                return pd.DataFrame()
 
-        # 尝试方法1
-        try:
-            df = ak.sw_index_third_info()
-            if df is not None and not df.empty:
-                df.rename(columns={'industry_code': '概念代码', 'industry_name': '概念名称'}, inplace=True)
-        except AttributeError:
-            pass
-
-        # 尝试方法2
-        if df is None or df.empty:
-            try:
-                df = ak.sw_index_third()
-                if df is not None and not df.empty:
-                    # 有时列名不同，尝试重命名
-                    if 'code' in df.columns:
-                        df.rename(columns={'code': '概念代码', 'name': '概念名称'}, inplace=True)
-            except AttributeError:
-                pass
-
-        if df is not None and not df.empty and '概念代码' in df.columns:
-            df['概念名称'] = '行业-' + df['概念名称'].astype(str)
-            return df[['概念名称', '概念代码']]
+            df['概念名称'] = '申万三级-' + df['概念名称'].astype(str)
+            return df[['概念名称', '概念代码']].copy()
         else:
-            print("  无法识别申万三级行业列表，请升级 akshare 或检查网络。")
+            print("  sw_index_third_info 返回空 DataFrame，请检查网络。")
     except Exception as e:
         print(f"  获取申万三级行业列表失败: {e}")
         print("  请尝试执行: pip install akshare --upgrade")
@@ -2738,66 +2734,7 @@ def fetch_industry_constituents_sw(board_code: str, board_name: str = "") -> pd.
         print(f"    获取申万行业成分股 {board_code} 失败: {e}")
     return pd.DataFrame()
 
-def build_stock_industry_index():
-    """
-    构建申万行业板块的股票-行业反向索引，并合并到概念缓存中
-    （只会添加新的行业归属，不影响已有的概念数据）
-    """
-    if TUSHARE_PRO is None:
-        print("❌ Tushare 未初始化，无法构建行业索引")
-        return
 
-    print("===== 构建申万行业指数（SW2021）=====")
-    # 1. 获取申万行业分类列表
-    try:
-        sw_list = TUSHARE_PRO.index_classify(level='L1', src='SW2021')
-        sw_list.rename(columns={'industry_name': '概念名称', 'index_code': '概念代码'}, inplace=True)
-        print(f"  申万行业板块数量: {len(sw_list)}")
-    except Exception as e:
-        print(f"❌ 获取申万行业列表失败: {e}")
-        return
-
-    # 2. 加载已有概念缓存（如果存在）
-    cache_path = os.path.join(os.path.dirname(__file__), "..", "data", "stock_concept_index.json")
-    if os.path.exists(cache_path):
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            stock_concept_map = json.load(f)
-        print(f"  已加载现有概念缓存，包含 {len(stock_concept_map)} 只股票")
-    else:
-        stock_concept_map = {}
-
-    # 3. 遍历每个行业，获取成分股并加入映射
-    total_industries = len(sw_list)
-    for idx, (_, row) in enumerate(sw_list.iterrows()):
-        industry_name = "行业-" + row["概念名称"]   # 加前缀区分概念
-        industry_code = row["概念代码"]
-
-        if (idx + 1) % 10 == 0 or idx == 0:
-            print(f"    进度: {idx+1}/{total_industries} — {industry_name}")
-
-        try:
-            member = TUSHARE_PRO.index_member(index_code=industry_code,
-                                              fields='ts_code,name')
-            if member is None or member.empty:
-                continue
-            for _, m_row in member.iterrows():
-                code = m_row['ts_code'][:6]
-                if code not in stock_concept_map:
-                    stock_concept_map[code] = []
-                # 避免重复
-                if not any(c["概念代码"] == industry_code for c in stock_concept_map[code]):
-                    stock_concept_map[code].append({
-                        "概念名称": industry_name,
-                        "概念代码": industry_code,
-                    })
-        except Exception as e:
-            print(f"    ⚠ {industry_name} 成分股获取失败: {e}")
-            continue
-
-    # 4. 保存回 JSON
-    with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(stock_concept_map, f, ensure_ascii=False, indent=2)
-    print(f"✅ 行业索引已合并，总计覆盖 {len(stock_concept_map)} 只股票")
 
 # ============================================================
 # 入口
