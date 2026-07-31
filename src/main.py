@@ -115,21 +115,25 @@ class StrategyConfig:
     min_daily_amount: float = 5e7             # 5000万
     min_daily_turnover: float = 0.01          # 1%
 
-    # 板块筛选
-    board_return_top_pct: float = 0.05
-    board_daily_limit_up_min: int = 3
-    leader_consecutive_days: int = 3
-    top_sectors_count: int = 2
+    # 板块筛选（龙头路径）
+    board_return_top_pct: float = 0.08         # 前8%涨幅阈值
+    board_daily_limit_up_min: int = 2          # 日均涨停≥2
+    leader_consecutive_days: int = 3           # 保留字段（实际龙头认定使用下方两个参数）
+    top_sectors_count: int = 2                 # 取前N个板块
+
+    # 龙头认定：近5日涨停≥2天 或 近10日涨停≥3天
+    leader_zt_days_min_5: int = 2
+    leader_zt_days_min_10: int = 3
 
     # 趋势路径阈值
-    board_return_top_pct_trend: float = 0.20
-    board_daily_limit_up_min_trend: float = 1.5
+    board_return_top_pct_trend: float = 0.30   # 前30%涨幅
+    board_daily_limit_up_min_trend: float = 1.0 # 日均涨停≥1 或 近3日有过涨停（逻辑内判断）
 
     # 跟风股筛选
     corr_threshold: float = 0.8
     corr_lookback: int = 60
-    follower_change_threshold: float = 0.08
-    follower_volume_ratio: float = 1.5
+    follower_change_threshold: float = 0.03
+    follower_volume_ratio: float = 1.0
     high_price_distance: float = 0.15
     high_price_lookback: int = 63
     market_cap_limit: float = 500
@@ -151,7 +155,7 @@ class StrategyConfig:
     # 数据
     data_lookback_days: int = 400
     request_delay: float = 3.0           # 改为3秒，大幅降低被断连概率
-    max_retries: int = 5                # 更多重试机会
+    max_retries: int = 3               # 更多重试机会
 
     # 板块拥挤度过滤
     board_crowding_limit_ratio: float = 0.30      # 当日涨停成分股占比上限
@@ -164,6 +168,7 @@ class StrategyConfig:
 
 
 CONFIG = StrategyConfig()
+_sector_rotation_history = []  # 记录最近3天的板块名称集合，用于轮动预警
 
 DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "daily")
 BOARD_DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "board_daily")
@@ -725,6 +730,88 @@ def _read_stock_3d_ret(code: str, cache_dir: str = DAILY_CACHE_DIR, eval_date: s
         return None
 
 
+def get_constituent_ret_median(codes: set, eval_date: str) -> float:
+    """计算给定股票集合的涨幅中位数（采样前N只，取近3日涨幅）"""
+    filtered = [c for c in codes if c[:2] in ('60', '00', '30')]
+    if not filtered:
+        return None
+    sample = filtered[:CONFIG.board_sample_top_n]
+    rets = []
+    for code in sample:
+        ret = _read_stock_3d_ret(code, eval_date=to_date_str(eval_date))
+        if ret is not None:
+            rets.append(ret)
+    if not rets:
+        return None
+    return float(np.median(rets))
+
+
+def calc_board_up_ratio(constituent_codes: set, trade_dates: List[str]) -> Tuple[float, float]:
+    """
+    计算板块近N日平均上涨家数占比，以及连续N日都满足阈值的条件。
+    返回 (avg_up_ratio, consecutive_up_days)
+    """
+    # 先从缓存获取每只股票在给定日期的涨跌方向
+    up_counts = []
+    total = 0
+    dates = trade_dates  # 格式 YYYYMMDD
+    valid_stocks = [c for c in constituent_codes if c[:2] in ('60', '00', '30')]
+    if not valid_stocks:
+        return 0.0, 0
+
+    # 为了避免重复拉取，预先获取所有成分股在所需日期的日线（仅拉取一次）
+    # 简单处理：逐个股票检查，从缓存读取涨跌幅
+    daily_ratios = []
+    for d in dates:
+        up = 0
+        total_stocks = 0
+        for code in valid_stocks:
+            cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
+            if not os.path.exists(cache_file):
+                # 缺失则尝试补拉最近一段时间
+                start_pull = (pd.to_datetime(d) - pd.Timedelta(days=20)).strftime("%Y%m%d")
+                fetch_stock_daily(code, start_pull, d)
+            if not os.path.exists(cache_file):
+                continue
+            try:
+                df = pd.read_csv(cache_file, parse_dates=["日期"])
+                close_col = "收盘价" if "收盘价" in df.columns else "收盘"
+                # 找到该日期的行
+                df['日期'] = pd.to_datetime(df['日期'])
+                today_row = df[df['日期'] == pd.to_datetime(d)]
+                if today_row.empty:
+                    continue
+                close_today = today_row[close_col].iloc[0]
+                # 获取前一交易日收盘价
+                prev_day = (pd.to_datetime(d) - pd.Timedelta(days=1))
+                prev_row = df[df['日期'] == prev_day]
+                if prev_row.empty:
+                    continue
+                close_prev = prev_row[close_col].iloc[0]
+                change = (close_today - close_prev) / close_prev
+                if change > 0:
+                    up += 1
+                total_stocks += 1
+            except Exception:
+                continue
+        if total_stocks > 0:
+            daily_ratios.append(up / total_stocks)
+        else:
+            daily_ratios.append(0.0)
+
+    avg_ratio = np.mean(daily_ratios) if daily_ratios else 0.0
+    # 连续满足>0.5的天数
+    consecutive = 0
+    max_consecutive = 0
+    for r in daily_ratios:
+        if r > CONFIG.board_up_ratio_line:
+            consecutive += 1
+            max_consecutive = max(max_consecutive, consecutive)
+        else:
+            consecutive = 0
+    return avg_ratio, max_consecutive
+
+
 def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_date: str = None) -> pd.DataFrame:
     """获取大盘指数日K线（Tushare 优先，akshare/Baostock 备用）"""
     if start_date is None:
@@ -990,33 +1077,40 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     trade_dates = get_trade_dates(eval_date, 10)
     recent_5_dates = trade_dates[-5:]
     recent_3_dates = trade_dates[-3:]
+    recent_10_dates = trade_dates[-10:]  # 取全部10日
 
     print(f"  评估日期: {eval_date}")
     print(f"  近5个交易日: {recent_5_dates}")
+    print(f"  近10个交易日: {recent_10_dates}")
 
     # ----------------------------------------------------------------
-    # 第1步：找出潜在龙头（近5日涨停>=4天）
+    # 第1步：找出潜在龙头（近5日涨停≥2天 或 近10日涨停≥3天）
     # ----------------------------------------------------------------
-    print("\n  [第1步] 找出潜在龙头（近5日涨停>=4天）...")
+    print("\n  [第1步] 找出潜在龙头（近5日≥2 或 近10日≥3）...")
 
     all_limit_up_data = {}
-    for d in recent_5_dates:
+    for d in trade_dates:
         lt_data = fetch_limit_up_pool(d)
         if lt_data is not None and not lt_data.empty:
             lt_data["日期"] = d
             lt_data = lt_data.drop_duplicates(subset=["代码", "日期"])
         all_limit_up_data[d] = lt_data
 
-    stock_zt_count = {}
+    stock_zt_count_5 = {}
+    stock_zt_count_10 = {}
     stock_zt_detail = {}
 
-    for d in recent_5_dates:
+    for d in trade_dates:
         lt_data = all_limit_up_data.get(d)
         if lt_data is None or lt_data.empty:
             continue
+        is_in_5 = d in recent_5_dates
         for _, row in lt_data.iterrows():
             code = row["代码"]
-            stock_zt_count[code] = stock_zt_count.get(code, 0) + 1
+            if is_in_5:
+                stock_zt_count_5[code] = stock_zt_count_5.get(code, 0) + 1
+            stock_zt_count_10[code] = stock_zt_count_10.get(code, 0) + 1
+
             if code not in stock_zt_detail:
                 stock_zt_detail[code] = {
                     "代码": code,
@@ -1037,22 +1131,25 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
                 stock_zt_detail[code]["首次封板时间"] = ft
 
     potential_leaders = []
-    for code, count in stock_zt_count.items():
-        if count >= 4:
-            info = stock_zt_detail[code]
-            info["涨停天数"] = count
+    for code, cnt10 in stock_zt_count_10.items():
+        cnt5 = stock_zt_count_5.get(code, 0)
+        if cnt5 >= 2 or cnt10 >= 3:
+            info = stock_zt_detail[code].copy()
+            info["涨停天数_5"] = cnt5
+            info["涨停天数_10"] = cnt10
+            info["涨停天数"] = cnt5   # 兼容后续原有逻辑
             potential_leaders.append(info)
 
     if not potential_leaders:
-        print("  ❌ 无潜在龙头（近5日涨停>=4天），识别结束")
+        print("  ❌ 无潜在龙头（近5日≥2 或 近10日≥3），路径A无结果")
         return []
 
-    potential_leaders.sort(key=lambda x: (x["涨停天数"], x["连板数"]), reverse=True)
+    potential_leaders.sort(key=lambda x: (x["涨停天数_5"], x["连板数"]), reverse=True)
     leader_codes_set = {ldr["代码"] for ldr in potential_leaders}
 
     print(f"  潜在龙头数量: {len(potential_leaders)}")
     for ldr in potential_leaders[:10]:
-        print(f"    {ldr['名称']}({ldr['代码']}) 涨停{ldr['涨停天数']}天 连板{ldr['连板数']}")
+        print(f"    {ldr['名称']}({ldr['代码']}) 近5日{ldr['涨停天数_5']}板 近10日{ldr['涨停天数_10']}板 连板{ldr['连板数']}")
 
     # ----------------------------------------------------------------
     # 第2步：检索龙头所属的全部概念板块（从缓存反向索引秒查）
@@ -1524,12 +1621,8 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
             recent_high = stock_df["最高"].tail(CONFIG.high_price_lookback).max()
             current_close = stock_df["收盘"].iloc[-1]
             high_distance = (recent_high - current_close) / recent_high
-            if high_distance >= CONFIG.high_price_distance:
-                continue
-
-            market_cap = _get_stock_market_cap(code, date_str)
-            if market_cap is not None and market_cap > 0 and (market_cap / 1e8) > CONFIG.market_cap_limit:
-                continue
+            # [近高点跌幅过滤已移除]
+            # [流通市值过滤已移除]
 
             # ---- 筹码安全垫：龙头启动前20日累计涨幅≤20% ----
             pre_end = leader_first_zt_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1980,3 +2073,4 @@ if __name__ == "__main__":
 
     # 执行2026年5月回测
     backtest_may_2026()
+
