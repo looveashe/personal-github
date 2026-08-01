@@ -161,8 +161,8 @@ class StrategyConfig:
 
     # 数据
     data_lookback_days: int = 400
-    request_delay: float = 3.0           # 改为3秒，大幅降低被断连概率
-    max_retries: int = 3               # 更多重试机会
+    request_delay: float = 5.0           # 进一步提高延迟，避免频率限制
+    max_retries: int = 3
 
     # 板块拥挤度过滤
     board_crowding_limit_ratio: float = 0.30      # 当日涨停成分股占比上限
@@ -179,6 +179,8 @@ _sector_rotation_history = []  # 记录最近3天的板块名称集合，用于�
 
 DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "daily")
 BOARD_DAILY_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "board_daily")
+
+
 
 # 独立缓存文件路径
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
@@ -359,46 +361,232 @@ def fetch_stock_pool() -> pd.DataFrame:
 
 def fetch_board_list() -> pd.DataFrame:
     """
-    获取板块列表（仅同花顺概念）。
+    获取概念板块列表（使用 akshare 同花顺概念，速度快）。
     申万三级行业由 build_industry_index_sw 单独构建并合入缓存。
     """
-    # Tushare 同花顺概念
-    if TUSHARE_PRO is not None:
-        try:
-            print("  使用Tushare获取同花顺概念板块列表...")
-            ts_concepts = TUSHARE_PRO.concept(src='THS')
-            if ts_concepts is not None and not ts_concepts.empty:
-                ts_concepts.rename(columns={'name': '概念名称', 'code': '概念代码'}, inplace=True)
-                print(f"  Tushare概念板块数量: {len(ts_concepts)}")
-                return ts_concepts[['概念名称', '概念代码']]
-        except Exception as e:
-            print(f"  Tushare概念列表获取失败: {e}")
+    try:
+        print("  使用 akshare 获取同花顺概念板块列表...")
+        df = _safe_ak_call(ak.stock_board_concept_name_ths, description="同花顺概念板块列表")
+        if df is not None and not df.empty:
+            # 列名适配：可能为中文名称/代码，板块名称/板块代码，或英文 name/code
+            if '名称' in df.columns and '代码' in df.columns:
+                df.rename(columns={'名称': '概念名称', '代码': '概念代码'}, inplace=True)
+            elif '板块名称' in df.columns and '板块代码' in df.columns:
+                df.rename(columns={'板块名称': '概念名称', '板块代码': '概念代码'}, inplace=True)
+            elif 'name' in df.columns and 'code' in df.columns:
+                df.rename(columns={'name': '概念名称', 'code': '概念代码'}, inplace=True)
+            else:
+                print("  ⚠ 概念板块列表列名异常，实际列名:", df.columns.tolist())
+                return pd.DataFrame()
+            print(f"  同花顺概念板块数量: {len(df)}")
+            return df[['概念名称', '概念代码']]
+    except Exception as e:
+        print(f"  ❌ 同花顺概念板块列表获取失败: {e}")
 
-    print("  ⚠ 同花顺概念板块获取失败（申万三级行业将在后续步骤单独构建）")
+    print("  ⚠ 无概念板块数据（申万三级行业将在后续步骤单独构建）")
     return pd.DataFrame()
 
 
-def fetch_concept_constituents_ths(concept_code: str, concept_name: str = "") -> pd.DataFrame:
+# 预定义常见 User-Agent，避免每次请求使用同一个
+_UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:110.0) Gecko/20100101 Firefox/110.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/109.0",
+]
+
+# 全局 Session，用于复用 Cookie
+_THS_SESSION = None
+
+def _get_ths_session():
+    """初始化同花顺请求会话，获取必要 Cookie"""
+    global _THS_SESSION
+    if _THS_SESSION is not None:
+        return _THS_SESSION
+    _THS_SESSION = requests.Session()
+    _THS_SESSION.headers.update({
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+    })
+    try:
+        # 先访问同花顺主页，获取初始 Cookie
+        _THS_SESSION.get("http://www.10jqka.com.cn", timeout=10)
+    except Exception:
+        pass
+    return _THS_SESSION
+
+
+def _scrape_ths_concept_page(concept_code_num: str) -> pd.DataFrame:
     """
-    使用 akshare 获取同花顺概念成分股。
+    获取同花顺概念成分股（使用纯数字代码，如 "308614"）。
+    优先使用同花顺 JSON 接口，备用 HTML 页面解析。
+    包含重试与延迟，避免被反爬。
+    返回列：['代码','名称']，失败返回空 DataFrame。
+    """
+    session = _get_ths_session()
+    base_referer = f"http://q.10jqka.com.cn/gn/detail/code/{concept_code_num}/"
+
+    # 共享的函数：执行带重试的请求
+    def _attempt_request(method, url, **kwargs):
+        for attempt in range(1, 4):  # 最多3次
+            try:
+                time.sleep(random.uniform(0.8, 2.0))   # 防止请求过快
+                headers = dict(session.headers)
+                headers["User-Agent"] = random.choice(_UA_LIST)
+                headers["Referer"] = base_referer
+                # 根据 url 调整 Accept
+                if "json" in url or "/ajax/" in url:
+                    headers["Accept"] = "application/json, text/plain, */*"
+                else:
+                    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                kwargs["headers"] = headers
+                if method == "get":
+                    resp = session.get(url, timeout=15, **kwargs)
+                elif method == "post":
+                    resp = session.post(url, timeout=15, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.RequestException, Exception) as e:
+                if attempt < 3:
+                    wait = 2 ** attempt
+                    time.sleep(wait)
+                else:
+                    return None
+
+    # 方法1：同花顺 JSON 接口（最稳定）
+    json_url = f"http://q.10jqka.com.cn/gn/detail/ajax/stock?code={concept_code_num}"
+    r = _attempt_request("get", json_url)
+    if r is not None:
+        try:
+            data = r.json()
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                records = []
+                for item in data["data"]:
+                    code = str(item.get("code", "")).strip()
+                    name = str(item.get("name", "")).strip()
+                    if code and len(code) == 6:
+                        records.append({"代码": code, "名称": name})
+                if records:
+                    return pd.DataFrame(records)
+        except Exception:
+            pass
+        # 方法2：HTML 详情页解析
+        r = _attempt_request("get", html_url)
+        if r is not None:
+            try:
+                dfs = _parse_html_tables(r.text)
+                for df in dfs:
+                    # 跳过仍为 MultiIndex 的 DataFrame（理论上已展平，兜底）
+                    if isinstance(df.columns, pd.MultiIndex):
+                        continue
+                    if "代码" in df.columns and "名称" in df.columns:
+                        return df[["代码", "名称"]].copy()
+            except Exception:
+                pass
+
+        # 方法3：页面内嵌的 var list 提取
+        try:
+            match = re.search(r'var\s+list\s*=\s*(\[.*?\]);', r.text, re.DOTALL)
+            if match:
+                arr = json.loads(match.group(1))
+                records = []
+                for item in arr:
+                    code = item.get("code", "")
+                    name = item.get("name", "")
+                    if code and len(code) == 6:
+                        records.append({"代码": code, "名称": name})
+                if records:
+                    return pd.DataFrame(records)
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
+def fetch_concept_constituents(concept_name: str, concept_code: str = "") -> pd.DataFrame:
+    """
+    获取概念成分股（通过爬取同花顺概念详情页）。
     返回 DataFrame，列：['代码','名称','概念代码','概念名称']
+    """
+    # 提取数字代码（去掉可能的“GN”等前缀）
+    code_num = str(concept_code).replace("GN", "").replace("gn", "")
+    df_raw = _scrape_ths_concept_page(code_num)
+    if df_raw.empty:
+        return pd.DataFrame()
+
+    # 清洗代码格式（只保留6位数字）
+    df_raw["代码"] = df_raw["代码"].astype(str).str.extract(r'(\d{6})', expand=False)
+    df_raw = df_raw.dropna(subset=["代码"])
+
+    df_raw["概念代码"] = concept_code
+    df_raw["概念名称"] = concept_name
+    return df_raw[["代码", "名称", "概念代码", "概念名称"]]
+
+
+def fetch_industry_list_sw() -> pd.DataFrame:
+    """
+    获取申万三级行业列表，返回列名为 '行业名称'、'行业代码'。
+    """
+    try:
+        df = ak.sw_index_third_info()
+        if df is not None and not df.empty:
+            if '行业代码' in df.columns and '行业名称' in df.columns:
+                df = df.rename(columns={'行业代码': '行业代码', '行业名称': '行业名称'})
+            elif 'industry_code' in df.columns and 'industry_name' in df.columns:
+                df = df.rename(columns={'industry_code': '行业代码', 'industry_name': '行业名称'})
+            else:
+                print("  sw_index_third_info 返回的列名不符合预期，请升级 akshare。")
+                print("  实际列名:", df.columns.tolist())
+                return pd.DataFrame()
+            df['行业名称'] = '申万三级-' + df['行业名称'].astype(str)
+            return df[['行业名称', '行业代码']].copy()
+        else:
+            print("  sw_index_third_info 返回空 DataFrame，请检查网络。")
+    except Exception as e:
+        print(f"  获取申万三级行业列表失败: {e}")
+        print("  请尝试执行: pip install akshare --upgrade")
+    return pd.DataFrame()
+
+
+def fetch_industry_constituents_sw(board_code: str, board_name: str = "") -> pd.DataFrame:
+    """
+    使用 akshare 获取申万三级行业成分股，返回列 '代码','名称'。
     """
     try:
         df = _safe_ak_call(
-            ak.stock_board_concept_cons_ths,
-            symbol=concept_code,
-            description=f"概念成分股 {concept_name or concept_code}",
+            ak.sw_index_third_cons,
+            symbol=board_code,
+            description=f"申万行业成分股 {board_name or board_code}",
             silent=True
         )
         if df is not None and not df.empty:
-            # 列名统一
+            col_map = {}
+            code_col = None
+            name_col = None
+            for col in df.columns:
+                col_clean = str(col).strip().lower()
+                if col_clean in ('代码', '股票代码', 'code', 'stock_code', 'ts_code', 'symbol',
+                                 'ticker', 'secucode', 'stockcode'):
+                    code_col = col
+                elif col_clean in ('名称', '股票名称', 'name', 'stock_name', 'secuname',
+                                   'stockname', 'companyname', 'sec_name'):
+                    name_col = col
+            if code_col and name_col:
+                df = df.rename(columns={code_col: '代码', name_col: '名称'})
+            elif len(df.columns) >= 2:
+                df = df.rename(columns={df.columns[0]: '代码', df.columns[1]: '名称'})
+            else:
+                return pd.DataFrame()
+
+            # 确保代码为6位数字
+            df['代码'] = df['代码'].astype(str).str.extract(r'(\d{6})', expand=False)
+            df = df.dropna(subset=['代码'])
             if '代码' in df.columns and '名称' in df.columns:
-                df = df[['代码', '名称']].copy()
-                df['概念代码'] = concept_code
-                df['概念名称'] = concept_name if concept_name else concept_code
-                return df[['代码', '名称', '概念代码', '概念名称']]
-    except Exception:
-        pass
+                return df[['代码', '名称']]
+    except Exception as e:
+        print(f"    获取申万行业成分股 {board_code} 失败: {e}")
     return pd.DataFrame()
 
 def fetch_board_index(board_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -420,8 +608,7 @@ def fetch_board_index(board_code: str, start_date: str, end_date: str) -> pd.Dat
 
 
 def _parse_html_tables(text: str) -> List[pd.DataFrame]:
-    """安全解析 HTML 表格，抑制 lxml/html5lib 的解析输出"""
-    # 预检查：确认 HTML 中包含 <table 标签
+    """安全解析 HTML 表格，抑制 lxml/html5lib 的解析输出，并统一处理多级标题"""
     if "<table" not in text.lower():
         return []
 
@@ -430,7 +617,15 @@ def _parse_html_tables(text: str) -> List[pd.DataFrame]:
     sys.stdout = io.StringIO()
     sys.stderr = io.StringIO()
     try:
-        return pd.read_html(io.StringIO(text))
+        dfs = pd.read_html(io.StringIO(text))
+        # 如果列索引是 MultiIndex（多级标题），展平为单一字符串
+        for i, df in enumerate(dfs):
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [
+                    '_'.join(filter(None, map(str, col))).strip('_')
+                    for col in df.columns
+                ]
+        return dfs
     except ValueError:
         return []
     finally:
@@ -473,34 +668,20 @@ def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFr
 
 
 def fetch_limit_up_pool(trade_date: str) -> pd.DataFrame:
-    """获取某日涨停板数据（Tushare 优先，akshare 备用）"""
-    result = None
-    # Tushare 涨停数据
-    if TUSHARE_PRO is not None:
-        try:
-            # limit_list 接口：limit_type='U' 表示涨停
-            limit_df = TUSHARE_PRO.limit_list(trade_date=trade_date, limit_type='U')
-            if limit_df is not None and not limit_df.empty:
-                limit_df['代码'] = limit_df['ts_code'].str[:6]
-                limit_df['名称'] = limit_df['name']
-                limit_df['日期'] = trade_date
-                limit_df['连板数'] = limit_df.get('limit_times', 0)
-                result = limit_df[['代码', '名称', '日期', '连板数']].copy()
-        except Exception as e:
-            print(f"    Tushare 涨停池 {trade_date} 失败: {e}，降级到 akshare")
-
-    # akshare 备用
-    if result is None:
-        result = _safe_ak_call(
-            ak.stock_zt_pool_em,
-            date=trade_date,
-            description=f"涨停板 {trade_date}",
-        )
-        if result is not None and not result.empty:
-            result["日期"] = trade_date
-    if result is None or result.empty:
-        return pd.DataFrame()
-    return result
+    """获取某日涨停板数据（仅使用 akshare 东方财富接口，Tushare 暂不可用）"""
+    result = _safe_ak_call(
+        ak.stock_zt_pool_em,
+        date=trade_date,
+        description=f"涨停板 {trade_date}",
+    )
+    if result is not None and not result.empty:
+        # ak.stock_zt_pool_em 返回列: 代码, 名称, 涨跌幅, 最新价, 成交额, ...
+        # 可能不含“连板数”，设为 0 兼容后续逻辑
+        if "连板数" not in result.columns:
+            result["连板数"] = 0
+        result["日期"] = trade_date
+        return result[["代码", "名称", "日期", "连板数"]].copy()
+    return pd.DataFrame()
 
 
 def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -644,6 +825,8 @@ def _invert_stock_concept_index() -> Dict[str, set]:
 def get_stock_concepts(code: str) -> List[Dict]:
     """
     获取某只股票的概念/行业标签，先查概念缓存，若不存在再查行业缓存。
+    概念缓存条目键名：'概念名称'、'概念代码'
+    行业缓存条目键名：'行业名称'、'行业代码'
     """
     # 尝试加载概念缓存
     if os.path.exists(CONCEPT_INDEX_PATH):
@@ -1005,47 +1188,50 @@ def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
         if boards.empty:
             return {}
 
-    stock_concept_map = {}
-    total = len(boards)
+        stock_concept_map = {}
+        total = len(boards)
+        for idx, (_, row) in enumerate(boards.iterrows()):
+            board_name = row["概念名称"]
+            board_code = row["概念代码"]
 
-    for idx, (_, row) in enumerate(boards.iterrows()):
-        board_name = row["概念名称"]
-        raw_code = str(row.get("概念代码", row.get("code", "")))
-        if "/" in raw_code:
-            board_num_code = raw_code.rstrip("/").split("/")[-1]
-        else:
-            board_num_code = raw_code
+            if (idx + 1) % 50 == 0 or idx == 0:
+                print(f"    进度: {idx+1}/{total}")
 
-        if (idx + 1) % 50 == 0 or idx == 0:
-            print(f"    进度: {idx+1}/{total}")
+            # 使用 akshare 同花顺概念成分股（已修复为 ak.stock_board_concept_cons_ths）
+            # 使用概念名称作为 symbol 获取成分股
+            constituents = fetch_concept_constituents(board_name, board_code)
+            if constituents.empty:
+                continue
 
-        constituents = fetch_board_constituents(board_num_code, board_name)
-        if constituents.empty:
-            continue
+            for _, stock_row in constituents.iterrows():
+                code = str(stock_row["代码"]).strip()[:6]
+                if not code.isdigit():
+                    continue
+                if code not in stock_concept_map:
+                    stock_concept_map[code] = []
+                stock_concept_map[code].append({
+                    "概念名称": board_name,
+                    "概念代码": board_code,
+                })
 
-        for _, stock_row in constituents.iterrows():
-            code = stock_row["代码"]
-            if code not in stock_concept_map:
-                stock_concept_map[code] = []
-            stock_concept_map[code].append({
-                "概念名称": board_name,
-                "概念代码": board_num_code,
-            })
+        # 写入独立缓存文件
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(stock_concept_map, f, ensure_ascii=False, indent=2)
+        print(f"  ✓ 概念索引已缓存至: {cache_path}，覆盖 {len(stock_concept_map)} 只股票")
 
-    # ---- 写入缓存 ----
-    cache_dir = os.path.dirname(STOCK_CONCEPT_CACHE)
-    os.makedirs(cache_dir, exist_ok=True)
-    with open(STOCK_CONCEPT_CACHE, "w", encoding="utf-8") as f:
-        json.dump(stock_concept_map, f, ensure_ascii=False, indent=2)
-    print(f"  ✓ 索引已缓存至: {STOCK_CONCEPT_CACHE}，覆盖 {len(stock_concept_map)} 只股票")
+        return stock_concept_map
 
-    return stock_concept_map
+    # 如果缓存有效，从文件加载返回
+    with open(cache_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def build_industry_index_sw():
     """
     构建申万三级行业索引，写入独立缓存文件。
     首次或超过365天自动全量更新。
+    缓存键名：'行业名称'、'行业代码'（与概念缓存分离）。
     """
     cache_path = INDUSTRY_SW_INDEX_PATH
     need_update = False
@@ -1076,8 +1262,8 @@ def build_industry_index_sw():
 
     total = len(industry_boards)
     for idx, (_, row) in enumerate(industry_boards.iterrows()):
-        industry_name = row['概念名称']
-        industry_code = row['概念代码']
+        industry_name = row['行业名称']
+        industry_code = row['行业代码']
         if (idx + 1) % 10 == 0 or idx == 0:
             print(f"    进度: {idx + 1}/{total} — {industry_name}")
 
@@ -1089,10 +1275,10 @@ def build_industry_index_sw():
             code = stock_row['代码']
             if code not in industry_map:
                 industry_map[code] = []
-            if not any(c['概念代码'] == industry_code for c in industry_map[code]):
+            if not any(c['行业代码'] == industry_code for c in industry_map[code]):
                 industry_map[code].append({
-                    "概念名称": industry_name,
-                    "概念代码": industry_code,
+                    "行业名称": industry_name,
+                    "行业代码": industry_code,
                 })
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -2713,59 +2899,7 @@ def backtest_may_2026():
         print("\n⚠ 整个5月无任何符合条件的信号")
 
 
-def fetch_industry_list_sw() -> pd.DataFrame:
-    """
-    获取申万三级行业列表（使用 sw_index_third_info，返回中文列名 '行业代码'/'行业名称'）。
-    """
-    try:
-        df = ak.sw_index_third_info()
-        if df is not None and not df.empty:
-            # akshare 新版本返回中文列名：行业代码 / 行业名称
-            if '行业代码' in df.columns and '行业名称' in df.columns:
-                df = df.rename(columns={
-                    '行业代码': '概念代码',
-                    '行业名称': '概念名称'
-                })
-            elif 'industry_code' in df.columns and 'industry_name' in df.columns:
-                # 兼容旧版本英文列名
-                df = df.rename(columns={
-                    'industry_code': '概念代码',
-                    'industry_name': '概念名称'
-                })
-            else:
-                print("  sw_index_third_info 返回的列名不符合预期，请升级 akshare。")
-                print("  实际列名:", df.columns.tolist())
-                return pd.DataFrame()
 
-            df['概念名称'] = '申万三级-' + df['概念名称'].astype(str)
-            return df[['概念名称', '概念代码']].copy()
-        else:
-            print("  sw_index_third_info 返回空 DataFrame，请检查网络。")
-    except Exception as e:
-        print(f"  获取申万三级行业列表失败: {e}")
-        print("  请尝试执行: pip install akshare --upgrade")
-    return pd.DataFrame()
-
-def fetch_industry_constituents_sw(board_code: str, board_name: str = "") -> pd.DataFrame:
-    """
-    使用 akshare 获取申万三级行业成分股。
-    """
-    try:
-        import akshare as ak
-        df = _safe_ak_call(
-            ak.sw_index_third_cons,
-            symbol=board_code,
-            description=f"申万行业成分股 {board_name or board_code}",
-            silent=True
-        )
-        if df is not None and not df.empty:
-            # 列名通常为 'stock_code', 'stock_name'
-            df.rename(columns={'stock_code': '代码', 'stock_name': '名称'}, inplace=True)
-            if '代码' in df.columns and '名称' in df.columns:
-                return df[['代码', '名称']]
-    except Exception as e:
-        print(f"    获取申万行业成分股 {board_code} 失败: {e}")
-    return pd.DataFrame()
 
 
 
@@ -2784,7 +2918,12 @@ if __name__ == "__main__":
             print("❌ Tushare 初始化失败，请检查 token 或安装 tushare")
     else:
         print("⚠ 未设置 Tushare token，将使用爬虫（速度慢）")
-    # result = daily_identify()
-    build_industry_index_sw()
+    result = daily_identify()
+    # 首次写入：强制重建概念和行业缓存
+    # print("\n===== 开始构建概念缓存 =====")
+    # build_stock_concept_index(force_refresh=True)  # 强制重建
+    # print("\n===== 开始构建行业缓存 =====")
+    # build_industry_index_sw()
+    # print("\n✅ 所有缓存写入完成")
 
 
