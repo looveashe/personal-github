@@ -18,6 +18,12 @@ import sys
 import io
 import warnings
 import re
+import jqdatasdk as jq
+from jqdatasdk import *
+
+# ========== 使用前必须登录聚宽账号 ==========
+jq.auth('15606865536', 'Liuqinzhong192')
+JQ_AUTHED = True
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -44,6 +50,13 @@ except ImportError:
     BAOSTOCK_AVAILABLE = False
     bs = None
 
+try:
+    import jqdatasdk as jq
+    JQDATASDK_AVAILABLE = True
+except ImportError:
+    JQDATASDK_AVAILABLE = False
+    jq = None
+
 TUSHARE_PRO = None
 _BS_LOGINED = False
 
@@ -69,6 +82,40 @@ def init_baostock():
         bs.login()
         _BS_LOGINED = True
     return _BS_LOGINED
+
+
+def init_jqdata(username: str = None, password: str = None) -> bool:
+    """初始化聚宽 jqdatasdk，返回是否成功"""
+    global JQ_AUTHED
+    if not JQDATASDK_AVAILABLE:
+        print("  jqdatasdk 未安装，请执行: pip install jqdatasdk")
+        return False
+    if JQ_AUTHED:
+        return True
+    try:
+        if username and password:
+            jq.auth(username, password)
+        JQ_AUTHED = True
+        print("  聚宽 jqdatasdk 登录成功")
+        return True
+    except Exception as e:
+        print(f"  聚宽登录失败: {e}")
+        return False
+
+
+def _to_jq_code(code: str) -> str:
+    """将6位代码转换为聚宽格式 (000001.XSHE, 600000.XSHG)"""
+    if '.' in code:
+        return code
+    if code.startswith(('6', '9')):
+        return f"{code}.XSHG"
+    else:
+        return f"{code}.XSHE"
+
+
+def _from_jq_code(jq_code: str) -> str:
+    """从聚宽格式提取6位代码"""
+    return jq_code.split('.')[0] if '.' in jq_code else jq_code
 
 warnings.filterwarnings('ignore')
 
@@ -137,7 +184,7 @@ class StrategyConfig:
     board_daily_limit_up_min_trend: float = 1.0 # 日均涨停≥1 或 近3日有过涨停（逻辑内判断）
 
     # 跟风股筛选
-    corr_threshold: float = 0.8
+    corr_threshold: float = 0.65
     corr_lookback: int = 60
     follower_change_threshold: float = 0.03
     follower_volume_ratio: float = 1.0
@@ -361,169 +408,63 @@ def fetch_stock_pool() -> pd.DataFrame:
 
 def fetch_board_list() -> pd.DataFrame:
     """
-    获取概念板块列表（使用 akshare 同花顺概念，速度快）。
-    申万三级行业由 build_industry_index_sw 单独构建并合入缓存。
+    获取概念板块列表（使用聚宽 jqdatasdk）。
     """
+    if not JQ_AUTHED:
+        print("  ⚠ 聚宽未登录，无法获取概念板块列表")
+        return pd.DataFrame()
     try:
-        print("  使用 akshare 获取同花顺概念板块列表...")
-        df = _safe_ak_call(ak.stock_board_concept_name_ths, description="同花顺概念板块列表")
-        if df is not None and not df.empty:
-            # 列名适配：可能为中文名称/代码，板块名称/板块代码，或英文 name/code
-            if '名称' in df.columns and '代码' in df.columns:
-                df.rename(columns={'名称': '概念名称', '代码': '概念代码'}, inplace=True)
-            elif '板块名称' in df.columns and '板块代码' in df.columns:
-                df.rename(columns={'板块名称': '概念名称', '板块代码': '概念代码'}, inplace=True)
-            elif 'name' in df.columns and 'code' in df.columns:
-                df.rename(columns={'name': '概念名称', 'code': '概念代码'}, inplace=True)
-            else:
-                print("  ⚠ 概念板块列表列名异常，实际列名:", df.columns.tolist())
-                return pd.DataFrame()
-            print(f"  同花顺概念板块数量: {len(df)}")
+        print("  使用聚宽获取概念板块列表...")
+        concept_df = jq.get_concepts()
+        if concept_df is not None and not concept_df.empty:
+            records = []
+            for idx, row in concept_df.iterrows():
+                records.append({
+                    '概念名称': row.get('name', str(idx)),
+                    '概念代码': str(idx)
+                })
+            df = pd.DataFrame(records)
+            print(f"  聚宽概念板块数量: {len(df)}")
             return df[['概念名称', '概念代码']]
+        else:
+            print("  ⚠ 聚宽返回空概念列表")
     except Exception as e:
-        print(f"  ❌ 同花顺概念板块列表获取失败: {e}")
-
-    print("  ⚠ 无概念板块数据（申万三级行业将在后续步骤单独构建）")
+        print(f"  ❌ 聚宽概念板块列表获取失败: {e}")
     return pd.DataFrame()
 
 
-# 预定义常见 User-Agent，避免每次请求使用同一个
-_UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:110.0) Gecko/20100101 Firefox/110.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/109.0",
-]
-
-# 全局 Session，用于复用 Cookie
-_THS_SESSION = None
-
-def _get_ths_session():
-    """初始化同花顺请求会话，获取必要 Cookie"""
-    global _THS_SESSION
-    if _THS_SESSION is not None:
-        return _THS_SESSION
-    _THS_SESSION = requests.Session()
-    _THS_SESSION.headers.update({
-        "User-Agent": random.choice(_UA_LIST),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-    })
-    try:
-        # 先访问同花顺主页，获取初始 Cookie
-        _THS_SESSION.get("http://www.10jqka.com.cn", timeout=10)
-    except Exception:
-        pass
-    return _THS_SESSION
-
-
-def _scrape_ths_concept_page(concept_code_num: str) -> pd.DataFrame:
-    """
-    获取同花顺概念成分股（使用纯数字代码，如 "308614"）。
-    优先使用同花顺 JSON 接口，备用 HTML 页面解析。
-    包含重试与延迟，避免被反爬。
-    返回列：['代码','名称']，失败返回空 DataFrame。
-    """
-    session = _get_ths_session()
-    base_referer = f"http://q.10jqka.com.cn/gn/detail/code/{concept_code_num}/"
-
-    # 共享的函数：执行带重试的请求
-    def _attempt_request(method, url, **kwargs):
-        for attempt in range(1, 4):  # 最多3次
-            try:
-                time.sleep(random.uniform(0.8, 2.0))   # 防止请求过快
-                headers = dict(session.headers)
-                headers["User-Agent"] = random.choice(_UA_LIST)
-                headers["Referer"] = base_referer
-                # 根据 url 调整 Accept
-                if "json" in url or "/ajax/" in url:
-                    headers["Accept"] = "application/json, text/plain, */*"
-                else:
-                    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                kwargs["headers"] = headers
-                if method == "get":
-                    resp = session.get(url, timeout=15, **kwargs)
-                elif method == "post":
-                    resp = session.post(url, timeout=15, **kwargs)
-                resp.raise_for_status()
-                return resp
-            except (requests.exceptions.RequestException, Exception) as e:
-                if attempt < 3:
-                    wait = 2 ** attempt
-                    time.sleep(wait)
-                else:
-                    return None
-
-    # 方法1：同花顺 JSON 接口（最稳定）
-    json_url = f"http://q.10jqka.com.cn/gn/detail/ajax/stock?code={concept_code_num}"
-    r = _attempt_request("get", json_url)
-    if r is not None:
-        try:
-            data = r.json()
-            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                records = []
-                for item in data["data"]:
-                    code = str(item.get("code", "")).strip()
-                    name = str(item.get("name", "")).strip()
-                    if code and len(code) == 6:
-                        records.append({"代码": code, "名称": name})
-                if records:
-                    return pd.DataFrame(records)
-        except Exception:
-            pass
-        # 方法2：HTML 详情页解析
-        r = _attempt_request("get", html_url)
-        if r is not None:
-            try:
-                dfs = _parse_html_tables(r.text)
-                for df in dfs:
-                    # 跳过仍为 MultiIndex 的 DataFrame（理论上已展平，兜底）
-                    if isinstance(df.columns, pd.MultiIndex):
-                        continue
-                    if "代码" in df.columns and "名称" in df.columns:
-                        return df[["代码", "名称"]].copy()
-            except Exception:
-                pass
-
-        # 方法3：页面内嵌的 var list 提取
-        try:
-            match = re.search(r'var\s+list\s*=\s*(\[.*?\]);', r.text, re.DOTALL)
-            if match:
-                arr = json.loads(match.group(1))
-                records = []
-                for item in arr:
-                    code = item.get("code", "")
-                    name = item.get("name", "")
-                    if code and len(code) == 6:
-                        records.append({"代码": code, "名称": name})
-                if records:
-                    return pd.DataFrame(records)
-        except Exception:
-            pass
-
-    return pd.DataFrame()
-
+# ═══════════════════════════════════════════════════════════
+# 以下同花顺爬虫函数已废弃，改用聚宽 jqdatasdk 获取成分股
+# ═══════════════════════════════════════════════════════════
+# _UA_LIST = [...]   # 已移除
+# _THS_SESSION = None   # 已移除
+# _get_ths_session()    # 已移除
+# _scrape_ths_concept_page(code)  # 已移除，用 fetch_concept_constituents (JQ) 替代
 def fetch_concept_constituents(concept_name: str, concept_code: str = "") -> pd.DataFrame:
     """
-    获取概念成分股（通过爬取同花顺概念详情页）。
+    获取概念成分股（仅使用聚宽 jqdatasdk，不再尝试东方财富接口）。
     返回 DataFrame，列：['代码','名称','概念代码','概念名称']
     """
-    # 提取数字代码（去掉可能的“GN”等前缀）
-    code_num = str(concept_code).replace("GN", "").replace("gn", "")
-    df_raw = _scrape_ths_concept_page(code_num)
-    if df_raw.empty:
+    if not JQ_AUTHED or not concept_code:
         return pd.DataFrame()
-
-    # 清洗代码格式（只保留6位数字）
-    df_raw["代码"] = df_raw["代码"].astype(str).str.extract(r'(\d{6})', expand=False)
-    df_raw = df_raw.dropna(subset=["代码"])
-
-    df_raw["概念代码"] = concept_code
-    df_raw["概念名称"] = concept_name
-    return df_raw[["代码", "名称", "概念代码", "概念名称"]]
-
+    try:
+        stocks = jq.get_concept_stocks(concept_code, date='2026-04-24')
+        if not stocks:
+            return pd.DataFrame()
+        records = []
+        for s in stocks:
+            code = _from_jq_code(s)
+            if code and len(code) == 6:
+                records.append({'代码': code, '名称': ''})
+        if records:
+            df = pd.DataFrame(records)
+            df['概念代码'] = concept_code
+            df['概念名称'] = concept_name
+            return df[['代码', '名称', '概念代码', '概念名称']]
+    except Exception as e:
+        # 只在异常时打印一次，以便排查个别板块权限问题
+        print(f"    ⚠ 聚宽获取概念 {concept_name}({concept_code}) 成分股失败: {e}")
+    return pd.DataFrame()
 
 def fetch_industry_list_sw() -> pd.DataFrame:
     """
@@ -638,32 +579,31 @@ def _parse_html_tables(text: str) -> List[pd.DataFrame]:
 
 def fetch_board_constituents(board_code: str, board_name: str = "") -> pd.DataFrame:
     """
-    获取板块成分股（概念或行业），不再使用任何东方财富接口。
-    - 概念板块：Tushare concept_detail
-    - 行业板块：Tushare index_member
-    - 若均失败返回空 DataFrame（不再爬虫）
+    获取板块成分股（概念板块通过聚宽获取；行业板块暂不可用）。
+    返回 DataFrame，列：['代码','名称','板块代码']
     """
-    if TUSHARE_PRO is None:
+    # 若为行业代码，暂不支持，返回空
+    if board_name.startswith('行业-') or board_code.startswith('BK'):
         return pd.DataFrame()
 
-    # 判断板块类型：概念代码一般为数字，行业代码以 'BK' 开头或名称含 '行业-'
-    is_industry = board_name.startswith('行业-') or board_code.startswith('BK')
+    # 使用聚宽获取概念成分股
+    if not JQ_AUTHED:
+        return pd.DataFrame()
     try:
-        if is_industry:
-            # 申万行业成分股
-            return fetch_industry_constituents_sw(board_code, board_name)
-        else:
-            # 概念板块
-            detail = TUSHARE_PRO.concept_detail(concept_code=board_code, fields='ts_code,name')
-            if detail is not None and not detail.empty:
-                detail['代码'] = detail['ts_code'].str[:6]
-                detail['名称'] = detail['name']
-                detail['板块代码'] = board_code
-                print(f"    ✅ 概念成分股 {board_name or board_code}: {len(detail)} 只")
-                return detail[['代码', '名称', '板块代码']]
-    except Exception as e:
-        print(f"    ⚠ Tushare 成分股获取失败 ({board_code}): {e}")
-
+        stocks = jq.get_concept_stocks(board_code, date='2026-04-24')
+        if not stocks:
+            return pd.DataFrame()
+        records = []
+        for s in stocks:
+            code = _from_jq_code(s)
+            if code and len(code) == 6:
+                records.append({'代码': code, '名称': ''})
+        if records:
+            df = pd.DataFrame(records)
+            df['板块代码'] = board_code
+            return df[['代码', '名称', '板块代码']]
+    except Exception:
+        pass
     return pd.DataFrame()
 
 
@@ -684,7 +624,7 @@ def fetch_limit_up_pool(trade_date: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def fetch_stock_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_stock_daily(code: str, start_date: str, end_date: str, silent: bool = False) -> pd.DataFrame:
     """获取个股日K线（前复权，新浪数据源），带本地缓存"""
     # 1. 检查缓存文件
     cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
@@ -975,18 +915,40 @@ def calc_board_up_ratio(constituent_codes: set, trade_dates: List[str]) -> Tuple
 
 
 def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """获取大盘指数日K线（Tushare 优先，akshare/Baostock 备用）"""
+    """获取大盘指数日K线（聚宽优先，Tushare/akshare/Baostock 备用）"""
     if start_date is None:
         start_date = (pd.to_datetime("today") - pd.Timedelta(days=CONFIG.index_start_offset)).strftime("%Y%m%d")
     if end_date is None:
         end_date = pd.to_datetime("today").strftime("%Y%m%d")
 
+    # 优先使用聚宽
+    if JQ_AUTHED:
+        try:
+            jq_code_map = {
+                "000300": "000300.XSHG",
+                "000001": "000001.XSHG",
+                "399001": "399001.XSHE",
+            }
+            jq_code = jq_code_map.get(index_code)
+            if jq_code:
+                df = jq.get_price(jq_code,
+                                  start_date=to_dash_date(start_date),
+                                  end_date=to_dash_date(end_date),
+                                  frequency='daily',
+                                  fields=['open', 'close', 'high', 'low', 'volume'])
+                if df is not None and not df.empty:
+                    df = df.reset_index()
+                    df.rename(columns={'index': 'date'}, inplace=True)
+                    df['date'] = pd.to_datetime(df['date'])
+                    return df[['date', 'open', 'high', 'low', 'close', 'volume']]
+        except Exception as e:
+            print(f"    聚宽指数数据 {index_code} 失败: {e}")
+
     result = None
 
-    # Tushare 指数日线
+    # Tushare 指数日线（仅当聚宽不可用时尝试）
     if TUSHARE_PRO is not None:
         try:
-            # 映射指数代码到 Tushare 的指数代码（如 000300.SH）
             ts_index_map = {
                 "000300": "000300.SH",
                 "000001": "000001.SH",
@@ -1050,6 +1012,148 @@ def fetch_index_daily(index_code: str = "000300", start_date: str = None, end_da
     mask = (result["date"] >= pd.to_datetime(start_date)) & (result["date"] <= pd.to_datetime(end_date))
     return result.loc[mask]
 
+
+def _get_limit_stocks_jq(date_str: str) -> pd.DataFrame:
+    """使用聚宽 jqdatasdk 获取某日全市场涨停股（涨幅 >= 9.8%），返回列：['代码','名称']"""
+    if not JQ_AUTHED:
+        return pd.DataFrame()
+    try:
+        dash = to_dash_date(date_str)
+        # 获取所有A股代码（聚宽格式）
+        all_securities = jq.get_all_securities(types=['stock'], date=dash)
+        # 只保留沪深A股（600/601/603/000/001/002/300）
+        target_prefix = ('600', '601', '603', '000', '001', '002', '300')
+        codes = [c for c in all_securities.index
+                 if c[:3] in target_prefix and c.endswith(('.XSHG', '.XSHE'))]
+        if not codes:
+            return pd.DataFrame()
+        # 批量获取日线数据（前复权，含前收盘价）
+        df = jq.get_price(codes, start_date=dash, end_date=dash,
+                          frequency='daily', fields=['close', 'pre_close'],
+                          skip_paused=True, fq='pre')
+        if df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+        df['pct_chg'] = (df['close'] - df['pre_close']) / df['pre_close']
+        zt = df[df['pct_chg'] >= 0.098].copy()
+        if zt.empty:
+            return pd.DataFrame()
+        # 转换为6位纯数字代码
+        zt['代码'] = zt['code'].apply(lambda x: x.split('.')[0])
+        return zt[['代码']].assign(名称='')
+    except Exception as e:
+        print(f"    ⚠ 聚宽涨停计算失败 {date_str}: {e}")
+        return pd.DataFrame()
+
+def _get_limit_stocks_bs(date_str: str) -> pd.DataFrame:
+    """使用 baostock 获取某日全市场涨停股（涨幅 >= 9.8%），返回 columns: ['代码','名称']"""
+    if not BAOSTOCK_AVAILABLE:
+        return pd.DataFrame()
+    init_baostock()
+    if not _BS_LOGINED:
+        return pd.DataFrame()
+    try:
+        # 转换为 baostock 要求的 YYYY-MM-DD 格式
+        date_dash = to_dash_date(date_str)
+        print(f"    🔄 baostock 涨停计算: {date_dash}")
+        # 1. 获取所有A股代码
+        rs_stock = bs.query_stock_basic(code_name="")
+        if rs_stock.error_code != '0':
+            print(f"    ⚠ baostock 获取股票列表失败: {rs_stock.error_msg}")
+            return pd.DataFrame()
+        stock_list = []
+        while rs_stock.next():
+            stock_list.append(rs_stock.get_row_data())
+        if not stock_list:
+            print("    ⚠ baostock 股票列表为空")
+            return pd.DataFrame()
+        all_stocks = pd.DataFrame(stock_list, columns=rs_stock.fields)
+        codes = all_stocks['code'].tolist()
+        print(f"    📊 待检查股票数量: {len(codes)}")
+        batch_size = 500
+        zt_codes = []
+        for i in range(0, len(codes), batch_size):
+            batch_codes = codes[i:i+batch_size]
+            code_str = ','.join(batch_codes)
+            rs = bs.query_history_k_data_plus(
+                code_str,
+                "date,code,close,preclose",
+                start_date=date_dash, end_date=date_dash,
+                frequency="d", adjustflag="2"
+            )
+            if rs.error_code != '0':
+                continue
+            while rs.next():
+                row = rs.get_row_data()
+                code = row[1]
+                close_val = float(row[2]) if row[2] else 0
+                preclose = float(row[3]) if row[3] else 0
+                if preclose and close_val:
+                    change = (close_val - preclose) / preclose
+                    if change >= 0.098 - 0.001:
+                        zt_codes.append(code)
+        if zt_codes:
+            zt_codes = list(set(zt_codes))
+            print(f"    ✅ 找到 {len(zt_codes)} 只涨停股")
+            return pd.DataFrame({'代码': zt_codes, '名称': ''})
+        else:
+            print("    ℹ️ 未找到涨幅≥9.8%的股票")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"    ❌ baostock 涨停计算异常 {date_str}: {e}")
+        return pd.DataFrame()
+
+def _get_batch_recent_ret_jq(eval_date: str, lookback_days: int = 4) -> Dict[str, Dict]:
+    """
+    利用聚宽批量获取所有A股近几日的收盘价，返回 {code: {'ret_3d': float, 'directions': {date: 1/0}}}
+    若失败或聚宽不可用，返回空字典。
+    """
+    if not JQ_AUTHED:
+        return {}
+    try:
+        end_dt = pd.to_datetime(eval_date)
+        start_dt = end_dt - pd.Timedelta(days=lookback_days + 5)  # 多取几天保险
+        price_df = jq.get_price(
+            jq.get_all_securities(types=['stock'], date=eval_date).index.tolist(),
+            start_date=start_dt.strftime("%Y-%m-%d"),
+            end_date=end_dt.strftime("%Y-%m-%d"),
+            frequency='daily',
+            fields=['close'],
+            skip_paused=True,
+            fq='pre'
+        )
+        if price_df.empty:
+            return {}
+        # 转换为面板，按股票代码索引
+        close_panel = price_df['close'].unstack(level=1)  # 日期为行，股票为列
+        # 仅保留A股（代码以6/0/3开头）
+        valid_codes = [c for c in close_panel.columns if c[:1] in ('6','0','3')]
+        close_panel = close_panel[valid_codes].sort_index()
+        # 取最近4个交易日（确保T日、T-1、T-2、T-3）
+        recent_dates = close_panel.index[-lookback_days:]
+        if len(recent_dates) < lookback_days:
+            return {}
+        result = {}
+        for code in valid_codes:
+            prices = close_panel[code].dropna()
+            if len(prices) < lookback_days:
+                continue
+            ret_3d = (prices.iloc[-1] - prices.iloc[-4]) / prices.iloc[-4]
+            directions = {}
+            # 为最近3个交易日计算涨跌方向（需要前一个交易日）
+            for i in range(1, len(prices)):
+                d_str = prices.index[i].strftime("%Y%m%d")
+                prev = prices.iloc[i-1]
+                cur = prices.iloc[i]
+                directions[d_str] = 1 if cur > prev else 0
+            result[code.split('.')[0]] = {
+                'ret_3d': ret_3d,
+                'directions': directions
+            }
+        return result
+    except Exception as e:
+        print(f"    ⚠ 聚宽批量数据获取失败: {e}")
+        return {}
 
 def check_index_trend(eval_date: str) -> bool:
     """
@@ -1201,6 +1305,8 @@ def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
             # 使用概念名称作为 symbol 获取成分股
             constituents = fetch_concept_constituents(board_name, board_code)
             if constituents.empty:
+                if (idx + 1) % 50 == 0:
+                    print(f"    ⚠ {board_name}({board_code}) 无成分股数据（可能数据源限制）")
                 continue
 
             for _, stock_row in constituents.iterrows():
@@ -1318,11 +1424,29 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
 
     all_limit_up_data = {}
     for d in trade_dates:
-        lt_data = fetch_limit_up_pool(d)
-        if lt_data is not None and not lt_data.empty:
-            lt_data["日期"] = d
-            lt_data = lt_data.drop_duplicates(subset=["代码", "日期"])
-        all_limit_up_data[d] = lt_data
+        # 优先使用聚宽
+        lt = None
+        if JQ_AUTHED:
+            lt = _get_limit_stocks_jq(d)
+            if lt is not None and not lt.empty:
+                print(f"    📥 {d} 涨停数据源: 聚宽（{len(lt)}只）")
+            else:
+                lt = None  # 聚宽无数据，继续回退
+        if lt is None or lt.empty:
+            lt = fetch_limit_up_pool(d)
+            if lt is not None and not lt.empty:
+                print(f"    📥 {d} 涨停数据源: akshare（{len(lt)}只）")
+        if lt is None or lt.empty:
+            lt = _get_limit_stocks_bs(d)
+            if lt is not None and not lt.empty:
+                print(f"    📥 {d} 涨停数据源: baostock（{len(lt)}只）")
+            else:
+                print(f"    ⚠ {d} 无涨停数据（所有数据源均未获取到）")
+        if lt is not None and not lt.empty:
+            lt = lt.drop_duplicates(subset=["代码"])
+        else:
+            lt = pd.DataFrame()
+        all_limit_up_data[d] = lt
 
     stock_zt_count_5 = {}
     stock_zt_count_10 = {}
@@ -1394,12 +1518,33 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     for ldr in potential_leaders:
         code = ldr["代码"]
         concepts = stock_concept_index.get(code, [])
-        if not concepts:
-            # 不再使用东方财富接口，若缓存缺失则尝试反向遍历概念索引（耗时，仅尝试一次）
-            print(f"    ⚠ {ldr['名称']}({code}) 无概念数据，尝试从索引反查...")
-            # 遍历所有概念，检查该股是否在成分股中（仅当强制重建时可能补齐）
-            # 此处不执行实时查询，直接跳过
-            print(f"    ❌ {ldr['名称']}({code}) 跳过（无板块归属）")
+        if not concepts and JQ_AUTHED:
+            # 缓存缺失，使用聚宽实时查询该股票所属的概念板块
+            print(f"    ⚠ {ldr['名称']}({code}) 无概念数据，使用聚宽查询...")
+            try:
+                jq_code = _to_jq_code(code)
+                # 获取所有概念代码列表
+                all_concepts_df = jq.get_concepts()
+                all_concept_codes = all_concepts_df.index.tolist()
+                matched_concepts = []
+                for ccode in all_concept_codes:
+                    try:
+                        stocks = jq.get_concept_stocks(ccode, date='2026-04-24')
+                        if jq_code in stocks:
+                            # 获取概念名称
+                            cname = all_concepts_df.loc[ccode, 'name'] if 'name' in all_concepts_df.columns else str(ccode)
+                            matched_concepts.append({"概念名称": cname, "概念代码": str(ccode)})
+                    except Exception:
+                        continue
+                if matched_concepts:
+                    # 临时补充到内存索引中（不写缓存）
+                    stock_concept_index[code] = matched_concepts
+                    concepts = matched_concepts
+                    print(f"    ✅ 聚宽查询到 {len(concepts)} 个概念")
+                else:
+                    print(f"    ❌ 聚宽也未找到概念，跳过")
+            except Exception as e:
+                print(f"    ❌ 聚宽查询失败: {e}")
         if not concepts:
             continue
         leader_board_map[code] = [(c["概念名称"], c["概念代码"]) for c in concepts]
@@ -1474,9 +1619,20 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     print("\n  [第3步] 计算板块热度...")
     MAX_SAMPLE = 50   # 采样前50只成分股用于热度指标计算
 
+    # ---- 预加载全市场近3日涨跌方向（用于上涨家数占比计算） ----
+    jq_stock_directions = {}
+    if JQ_AUTHED:
+        print("  预加载全市场股票近3日涨跌方向（聚宽）...")
+        jq_data = _get_batch_recent_ret_jq(eval_date, lookback_days=4)
+        for code, info in jq_data.items():
+            jq_stock_directions[code] = info.get("directions", {})
+        print(f"  聚宽方向数据覆盖 {len(jq_stock_directions)} 只股票")
+
     # ---------- 动态上涨家数占比阈值：根据大盘环境调整 ----------
     threshold_up_ratio = 0.6   # 默认上升周期60%
     env_valid = False
+    on_ma20 = False
+    consecutive_down = 0
     try:
         idx_df = fetch_index_daily(
             CONFIG.index_code,
@@ -1487,24 +1643,24 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
             close = idx_df["close"]
             ma20 = close.rolling(20).mean()
             on_ma20 = close.iloc[-1] >= ma20.iloc[-1]
-            # 连续下跌天数（从最近往前数）
-            pct = close.pct_change()
-            consecutive_down = 0
-            for i in range(len(pct) - 1, 0, -1):
-                if pct.iloc[i] < 0:
+            # 连续下跌天数
+            pct_chg = close.pct_change()
+            for i in range(len(pct_chg)-1, -1, -1):
+                if pct_chg.iloc[i] < 0:
                     consecutive_down += 1
                 else:
                     break
             env_valid = True
-            if not on_ma20:
-                if consecutive_down >= 3:
+            if on_ma20:
+                threshold_up_ratio = 0.6
+                print(f"  📈 大盘位于20日线上方，阈值保持60%")
+            else:
+                if consecutive_down >= 5:
                     threshold_up_ratio = 0.3
-                    print(f"  📉 大盘位于20日线下方且连续下跌{consecutive_down}天，上涨家数占比阈值降至30%")
+                    print(f"  🥶 大盘位于20日线下方且连续下跌{consecutive_down}天，上涨家数占比阈值降至30%")
                 else:
                     threshold_up_ratio = 0.4
                     print(f"  📉 大盘位于20日线下方，上涨家数占比阈值降至40%")
-            else:
-                print(f"  📈 大盘位于20日线上方，阈值保持60%")
     except Exception:
         pass  # 异常则默认60%
 
@@ -1513,7 +1669,7 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
         if on_ma20:
             limit_up_threshold = 3.0
             print(f"  📈 上升周期，日均涨停家数阈值设为 {limit_up_threshold}")
-        elif consecutive_down >= 3:
+        elif consecutive_down >= 5:
             limit_up_threshold = None  # 寒冬周期跳过涨停家数检查
             print(f"  🧊 寒冬周期，日均涨停家数条件跳过")
         else:
@@ -1567,39 +1723,47 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
             ret_3d = -999.0
         board_info["近3日涨幅"] = ret_3d
 
-        # ----- 计算上涨家数占比（基于样本股在近3日的涨跌） -----
+        # ----- 计算上涨家数占比（优先使用聚宽方向数据，样本股 = 所有有效成分股） -----
         up_ratios = []
+        # 使用全部有效成分股代码（限制数量以提高速度，最多200只）
+        all_valid_codes = [c for c in constituent_codes if c[:2] in ('60', '00', '30')][:200]
         for day_str in recent_3_dates:
             up_count = 0
             total = 0
-            for code, _ in stock_ret_list:  # 复用已有涨幅的股票列表（确保有日线缓存）
-                # 从缓存读取该日涨跌方向
-                cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
-                if not os.path.exists(cache_file):
-                    # 缺失则尝试补拉最近20天
-                    start_pull = (pd.to_datetime(day_str) - pd.Timedelta(days=20)).strftime("%Y%m%d")
-                    fetch_stock_daily(code, start_pull, day_str)
-                if not os.path.exists(cache_file):
-                    continue
-                try:
-                    df = pd.read_csv(cache_file, parse_dates=["日期"])
-                    close_col = "收盘价" if "收盘价" in df.columns else "收盘"
-                    df['日期'] = pd.to_datetime(df['日期'])
-                    today_row = df[df['日期'] == pd.to_datetime(day_str)]
-                    if today_row.empty:
-                        continue
-                    close_today = today_row[close_col].iloc[0]
-                    # 前一交易日
-                    prev_day = (pd.to_datetime(day_str) - pd.Timedelta(days=1))
-                    prev_row = df[df['日期'] == prev_day]
-                    if prev_row.empty:
-                        continue
-                    close_prev = prev_row[close_col].iloc[0]
-                    if close_today > close_prev:
+            for code in all_valid_codes:
+                # 优先从聚宽方向缓存中获取
+                up = jq_stock_directions.get(code, {}).get(day_str)
+                if up is not None:
+                    if up == 1:
                         up_count += 1
                     total += 1
-                except Exception:
-                    continue
+                else:
+                    # 回退到本地缓存
+                    cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
+                    if not os.path.exists(cache_file):
+                        # 缺失则补拉
+                        start_pull = (pd.to_datetime(day_str) - pd.Timedelta(days=20)).strftime("%Y%m%d")
+                        fetch_stock_daily(code, start_pull, day_str)
+                    if not os.path.exists(cache_file):
+                        continue
+                    try:
+                        df = pd.read_csv(cache_file, parse_dates=["日期"])
+                        close_col = "收盘价" if "收盘价" in df.columns else "收盘"
+                        df['日期'] = pd.to_datetime(df['日期'])
+                        today_row = df[df['日期'] == pd.to_datetime(day_str)]
+                        if today_row.empty:
+                            continue
+                        close_today = today_row[close_col].iloc[0]
+                        prev_day = pd.to_datetime(day_str) - pd.Timedelta(days=1)
+                        prev_row = df[df['日期'] == prev_day]
+                        if prev_row.empty:
+                            continue
+                        close_prev = prev_row[close_col].iloc[0]
+                        if close_today > close_prev:
+                            up_count += 1
+                        total += 1
+                    except Exception:
+                        continue
             if total > 0:
                 up_ratios.append(up_count / total)
         if up_ratios:
@@ -1657,7 +1821,7 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
 
     top_n = max(1, int(len(board_returns_list) * CONFIG.board_return_top_pct))
     top_threshold = board_returns_list[min(top_n, len(board_returns_list)) - 1][1]
-    print(f"  前5%涨幅阈值: {top_threshold:.4f}（有效板块{len(board_returns_list)}个，前{top_n}个）")
+    print(f"  前40%涨幅阈值: {top_threshold:.4f}（有效板块{len(board_returns_list)}个，前{top_n}个）")
 
     # 板块涨幅排名分（百分位：最高100，最低0）
     N_boards = len(board_returns_list)
@@ -1810,59 +1974,8 @@ def screen_trend_sectors(eval_date: str) -> List[Dict]:
     # 本地股票缓存目录（与 fetch_stock_daily 一致）
     stock_cache_dir = DAILY_CACHE_DIR
 
-    print("  预加载全部股票近3日数据至内存（一次IO）...")
-    # 收集所有板块需要考察的股票代码（去重）
-    all_need_codes = set()
-    for raw_code in board_constituents_map:
-        codes = board_constituents_map[raw_code]
-        filtered = {c for c in codes if c[:2] in ('60', '00', '30')}
-        all_need_codes.update(filtered)
-    print(f"  涉及股票数量: {len(all_need_codes)}")
-
-    # 内存缓存：{code: {'ret_3d': float|None, 'directions': {date: 1/0}}}
-    stock_mem_cache = {}
-    for code in all_need_codes:
-        cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
-        record = {"ret_3d": None, "directions": {}}
-        if not os.path.exists(cache_file):
-            # 自动补拉最近20天
-            start_pull = (pd.to_datetime(date_str) - pd.Timedelta(days=20)).strftime("%Y%m%d")
-            fetch_stock_daily(code, start_pull, date_str)
-        if not os.path.exists(cache_file):
-            stock_mem_cache[code] = record
-            continue
-        try:
-            df = pd.read_csv(cache_file, parse_dates=["日期"])
-            close_col = "收盘价" if "收盘价" in df.columns else "收盘"
-            df['日期'] = pd.to_datetime(df['日期'])
-            closes = df[close_col].values
-            if len(closes) >= 4:
-                record["ret_3d"] = (closes[-1] - closes[-4]) / closes[-4]
-            # 预计算3个交易日的涨跌方向（1涨，0跌）
-            for d in recent_3_dates:
-                try:
-                    today_mask = df['日期'] == pd.to_datetime(d)
-                    prev_day = pd.to_datetime(d) - pd.Timedelta(days=1)
-                    prev_mask = df['日期'] == prev_day
-                    if today_mask.any() and prev_mask.any():
-                        close_today = df.loc[today_mask, close_col].iloc[0]
-                        close_prev = df.loc[prev_mask, close_col].iloc[0]
-                        record["directions"][d] = 1 if close_today > close_prev else 0
-                    else:
-                        record["directions"][d] = None
-                except Exception:
-                    record["directions"][d] = None
-        except Exception:
-            pass
-        stock_mem_cache[code] = record
-
-    # 预加载流通市值（可选，若耗时太长可跳过）
-    code_mcap_cache = {}
-    # 仅对市值函数可能返回非空做批量预取（本处暂保留单次调用，后续可加入tushare批量优化）
-    # 为加速，这里简单跳过预取，市值信息在板块计算中按需要实时调用，但会减慢少量速度
-    # 如需进一步提速，可去掉市值挑选逻辑，直接使用涨幅前10
-
-    print(f"  遍历 {len(boards)} 个板块计算涨幅与涨停数...")
+    # 直接使用板块指数计算涨幅（无需个股预加载）
+    print(f"  遍历 {len(boards)} 个板块，使用板块指数计算涨幅...")
     board_records = []
     for idx, (_, row) in enumerate(boards.iterrows()):
         board_name = row["概念名称"]
@@ -1872,34 +1985,19 @@ def screen_trend_sectors(eval_date: str) -> List[Dict]:
         else:
             board_code = raw_code
 
+        # 板块指数3日涨幅
+        idx_start = (pd.to_datetime(eval_date) - pd.Timedelta(days=30)).strftime("%Y%m%d")
+        idx_df = _fetch_board_index_cached(board_code, idx_start, date_str)
+        if idx_df.empty or len(idx_df) < 4:
+            continue
+        # 统一收盘价列名
+        close_col = "收盘价" if "收盘价" in idx_df.columns else "收盘"
+        if close_col not in idx_df.columns:
+            continue
+        ret_3d = (idx_df[close_col].iloc[-1] - idx_df[close_col].iloc[-4]) / idx_df[close_col].iloc[-4]
+
+        # 成分股集合（用于涨停家数计算）
         constituent_codes = board_constituents_map.get(board_code, set())
-        if not constituent_codes:
-            continue
-
-        filtered_codes = [c for c in constituent_codes if c[:2] in ('60', '00', '30')]
-        if not filtered_codes:
-            continue
-        MAX_SAMPLE = 50
-        sample_codes = filtered_codes[:MAX_SAMPLE]
-
-        # 从内存获取近3日涨幅
-        stock_ret_list = []
-        for code in sample_codes:
-            ret = stock_mem_cache.get(code, {}).get("ret_3d")
-            if ret is not None:
-                stock_ret_list.append((code, ret))
-        if not stock_ret_list:
-            continue
-
-        # 市值中位数方案（保留原逻辑，但市值仍可能慢，此处先保留简单版本以提速）
-        # 如果市值获取慢，可跳过市值环节，直接用涨幅前10
-        # 这里提供快速版：直接涨幅前10中位数
-        stock_ret_list.sort(key=lambda x: x[1], reverse=True)
-        top_n = min(10, len(stock_ret_list))
-        top_rets = [x[1] for x in stock_ret_list[:top_n]]
-        ret_3d = float(np.median(top_rets))
-
-        # 日均涨停家数
         daily_limit_counts = []
         for d in recent_3_dates:
             lt_data = all_limit_up_data.get(d)
@@ -2413,6 +2511,10 @@ def screen_followers(main_sectors: List[Dict], eval_date: str) -> List[Dict]:
         print(f"    遍历成分股: {stock_count}, 匹配: {matched_count}")
 
     print(f"\n  候选跟风股总数: {len(candidates)}")
+    if candidates:
+        print("  候选跟风股列表:")
+        for c in candidates:
+            print(f"    {c.get('代码','')} {c.get('名称','')} | 板块:{c.get('板块','')} | 龙头:{c.get('对应龙头','')} | 相关系数:{c.get('相关系数','')} | 龙头涨停日涨幅:{c.get('龙头涨停日涨幅','')} | 轮动级别:{c.get('轮动级别','')}")
     return candidates
 
 
@@ -2908,6 +3010,8 @@ def backtest_may_2026():
 # ============================================================
 
 if __name__ == "__main__":
+    # 聚宽登录（确保 JQ_AUTHED 已设为 True）
+    init_jqdata()
     # 填入你的 Tushare token（从 https://tushare.pro 个人中心获取）
     tushare_token = "b9dcf9759a297c0a8fef5cf8b73d7d09af50c31444c041c115ba66d7"
     if tushare_token:
@@ -2918,12 +3022,13 @@ if __name__ == "__main__":
             print("❌ Tushare 初始化失败，请检查 token 或安装 tushare")
     else:
         print("⚠ 未设置 Tushare token，将使用爬虫（速度慢）")
-    result = daily_identify()
-    # 首次写入：强制重建概念和行业缓存
+    # ---- 首次或按需重建概念缓存（需使用聚宽试用期内的日期） ----
     # print("\n===== 开始构建概念缓存 =====")
-    # build_stock_concept_index(force_refresh=True)  # 强制重建
-    # print("\n===== 开始构建行业缓存 =====")
-    # build_industry_index_sw()
-    # print("\n✅ 所有缓存写入完成")
+
+    # build_stock_concept_index(force_refresh=True)      # 以 2026-04-24 为基准
+    # print("\n✅ 概念缓存写入完成")
+
+    # 运行策略（使用真实历史日期，确保行情数据可获取）
+    result = daily_identify("2025-08-24")
 
 
