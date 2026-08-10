@@ -18,9 +18,14 @@ import sys
 import io
 import warnings
 import re
+import math
 import jqdatasdk as jq
 from jqdatasdk import *
+import tushare
 
+
+# ========== tutoken ==========
+tushare.set_token('b9dcf9759a297c0a8fef5cf8b73d7d09af50c31444c041c115ba66d7')
 # ========== 使用前必须登录聚宽账号 ==========
 jq.auth('15606865536', 'Liuqinzhong192')
 JQ_AUTHED = True
@@ -170,7 +175,7 @@ class StrategyConfig:
     min_daily_turnover: float = 0.01          # 1%
 
     # 板块筛选（龙头路径）
-    board_return_top_pct: float = 0.08         # 前8%涨幅阈值
+    board_return_top_pct: float = 0.3         # 前30%涨幅阈值
     board_daily_limit_up_min: int = 2          # 日均涨停≥2
     leader_consecutive_days: int = 3           # 保留字段（实际龙头认定使用下方两个参数）
     top_sectors_count: int = 2                 # 取前N个板块
@@ -408,7 +413,7 @@ def fetch_stock_pool() -> pd.DataFrame:
 
 def fetch_board_list() -> pd.DataFrame:
     """
-    获取概念板块列表（使用聚宽 jqdatasdk）。
+    获取概念板块列表（使用聚宽 jqdatasdk），并过滤宽基指数板块（成分股>500）和无意义通用板块。
     """
     if not JQ_AUTHED:
         print("  ⚠ 聚宽未登录，无法获取概念板块列表")
@@ -416,15 +421,29 @@ def fetch_board_list() -> pd.DataFrame:
     try:
         print("  使用聚宽获取概念板块列表...")
         concept_df = jq.get_concepts()
-        if concept_df is not None and not concept_df.empty:
+        if concept_df is None or not concept_df.empty:
             records = []
+            # 黑名单：按名称过滤，避免无效宽基板块
+            BLACKLIST = {'融资融券', '沪股通', '深股通', 'MSCI概念', '标普道琼斯A股',
+                         '富时罗素概念', '富时罗素概念股'}
             for idx, row in concept_df.iterrows():
+                name = row.get('name', str(idx))
+                if name in BLACKLIST:
+                    continue
+                # 额外过滤：成分股数量超过 500 的板块（宽基指数特征）
+                try:
+                    stocks = jq.get_concept_stocks(str(idx), date='2026-04-24')
+                    if len(stocks) > 500:
+                        continue
+                except:
+                    # 无法获取成分股，极可能是宽基指数，直接剔除
+                    continue
                 records.append({
-                    '概念名称': row.get('name', str(idx)),
+                    '概念名称': name,
                     '概念代码': str(idx)
                 })
             df = pd.DataFrame(records)
-            print(f"  聚宽概念板块数量: {len(df)}")
+            print(f"  聚宽概念板块数量（过滤后）: {len(df)}")
             return df[['概念名称', '概念代码']]
         else:
             print("  ⚠ 聚宽返回空概念列表")
@@ -1272,18 +1291,30 @@ def build_stock_concept_index(force_refresh: bool = False) -> Dict[str, list]:
     首次或超过30天自动全量更新。
     """
     cache_path = CONCEPT_INDEX_PATH
+    # ---- 确保缓存目录存在 ----
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
     # 检查是否需要刷新
     need_update = force_refresh
-    if not need_update and os.path.exists(cache_path):
-        mtime = datetime.date.fromtimestamp(os.path.getmtime(cache_path))
-        if (datetime.date.today() - mtime).days >= 30:
-            need_update = True
+    if not need_update:
+        if os.path.exists(cache_path):
+            mtime = datetime.date.fromtimestamp(os.path.getmtime(cache_path))
+            if (datetime.date.today() - mtime).days >= 30:
+                need_update = True
+            else:
+                print(f"  ✓ 概念缓存有效 ({mtime})，直接加载")
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                    if cached:
+                        return cached
+                    # 缓存内容为空，触发重建
+                    need_update = True
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    print(f"  ⚠ 概念缓存读取失败 ({e})，重新构建")
+                    need_update = True
         else:
-            print(f"  ✓ 概念缓存有效 ({mtime})，直接加载")
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if cached:
-                return cached
+            # 文件不存在，首次运行
             need_update = True
 
     if need_update:
@@ -1340,6 +1371,9 @@ def build_industry_index_sw():
     缓存键名：'行业名称'、'行业代码'（与概念缓存分离）。
     """
     cache_path = INDUSTRY_SW_INDEX_PATH
+    # 确保缓存目录存在
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
     need_update = False
     if os.path.exists(cache_path):
         mtime = datetime.date.fromtimestamp(os.path.getmtime(cache_path))
@@ -1614,19 +1648,9 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
     print(f"  板块映射后候选板块数量: {len(board_candidate_pool)}")
 
     # ----------------------------------------------------------------
-    # 第3步：计算板块热度（涨幅中位数、上涨家数占比、日均涨停家数）
+    # 第3步：计算板块热度（市值前10成分股 近3日涨幅中位数）
     # ----------------------------------------------------------------
-    print("\n  [第3步] 计算板块热度...")
-    MAX_SAMPLE = 50   # 采样前50只成分股用于热度指标计算
-
-    # ---- 预加载全市场近3日涨跌方向（用于上涨家数占比计算） ----
-    jq_stock_directions = {}
-    if JQ_AUTHED:
-        print("  预加载全市场股票近3日涨跌方向（聚宽）...")
-        jq_data = _get_batch_recent_ret_jq(eval_date, lookback_days=4)
-        for code, info in jq_data.items():
-            jq_stock_directions[code] = info.get("directions", {})
-        print(f"  聚宽方向数据覆盖 {len(jq_stock_directions)} 只股票")
+    print("\n  [第3步] 计算板块热度（市值前10成分股 近3日涨幅中位数）...")
 
     # ---------- 动态上涨家数占比阈值：根据大盘环境调整 ----------
     threshold_up_ratio = 0.6   # 默认上升周期60%
@@ -1679,6 +1703,93 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
         limit_up_threshold = CONFIG.board_daily_limit_up_min
         print(f"  使用默认日均涨停家数阈值 {limit_up_threshold}")
 
+    # ---- 预加载所有需要的股票近3日涨幅和涨跌方向（避免逐只网络请求） ----
+    # 1. 收集所有板块的全部成分股（去重）
+    all_needed_codes = set()
+    for board_info in board_candidate_pool.values():
+        codes = board_info.get("成分股代码集", set())
+        for c in codes:
+            if c[:2] in ('60', '00', '30'):
+                all_needed_codes.add(c)
+    print(f"  需要批次预加载的股票总数: {len(all_needed_codes)}")
+
+    # 2. 使用聚宽批量获取数据（若无聚宽则回退到逐只缓存）
+    if JQ_AUTHED and all_needed_codes:
+        end_dt = pd.to_datetime(date_str)
+        start_dt = end_dt - pd.Timedelta(days=100)  # 足够计算近3日涨幅
+        batch_size = 300  # 聚宽单次请求上限，分批获取
+        all_codes_list = list(all_needed_codes)
+        ret_3d_map = {}
+        direction_map = {}
+        recent_dates = pd.to_datetime(recent_3_dates)
+        print(f"    开始分批聚宽获取，共 {len(all_codes_list)} 只，每批 {batch_size} 只")
+        try:
+            for batch_start in range(0, len(all_codes_list), batch_size):
+                batch_codes = all_codes_list[batch_start:batch_start+batch_size]
+                jq_codes = [_to_jq_code(c) for c in batch_codes]
+                jq_prices = jq.get_price(
+                    jq_codes,
+                    start_date=start_dt.strftime("%Y-%m-%d"),
+                    end_date=end_dt.strftime("%Y-%m-%d"),
+                    frequency='daily',
+                    fields=['close'],
+                    skip_paused=True,
+                    fq='pre'
+                )
+                if jq_prices.empty:
+                    continue
+                close_series = jq_prices['close']
+                # 转为 DataFrame (行=日期, 列=股票代码)
+                if isinstance(close_series.index, pd.MultiIndex):
+                    df_close = close_series.unstack(level=1)
+                else:
+                    df_close = close_series.to_frame(name=jq_codes[0] if jq_codes else 'unknown')
+                df_close = df_close.sort_index()
+                # 遍历每只股票计算涨幅和方向
+                for code in df_close.columns:
+                    code_clean = _from_jq_code(code)
+                    series = df_close[code].dropna()
+                    if len(series) < 4:
+                        continue
+                    ret = (series.iloc[-1] - series.iloc[-4]) / series.iloc[-4]
+                    ret_3d_map[code_clean] = ret
+                    # ---- 修复：仅基于真实交易日计算涨跌方向（强制索引类型） ----
+                    dirs = {}
+                    temp_series = series.dropna()
+                    # 保证索引为 DatetimeIndex，避免与 Timestamp 比较时类型不匹配
+                    if not isinstance(temp_series.index, pd.DatetimeIndex):
+                        temp_series.index = pd.to_datetime(temp_series.index)
+                    temp_pct = temp_series.pct_change().dropna()
+                    for day in recent_dates:
+                        day_fmt = day.strftime("%Y%m%d")
+                        if day in temp_pct.index:
+                            val = temp_pct.loc[day]
+                            dirs[day_fmt] = 1 if (not pd.isna(val) and val > 0) else 0
+                        else:
+                            # 尝试从最近一个 ≤ day 的日期推算
+                            idx_dt = pd.DatetimeIndex(temp_series.index)  # 再次保险
+                            prev_dates = idx_dt[idx_dt <= day]
+                            if len(prev_dates) >= 2:
+                                cur_px = temp_series.loc[prev_dates[-1]]
+                                prev_px = temp_series.loc[prev_dates[-2]]
+                                dirs[day_fmt] = 1 if cur_px > prev_px else 0
+                            else:
+                                dirs[day_fmt] = 0
+                    direction_map[code_clean] = dirs
+            print(f"    聚宽分批获取完成，有效涨幅数据 {len(ret_3d_map)} 只")
+            # 方向数据质量检查
+            has_up = sum(1 for dmap in direction_map.values()
+                        if any(v == 1 for v in dmap.values()))
+            print(f"    方向数据至少有一天上涨的股票: {has_up} 只")
+        except Exception as e:
+            print(f"    ⚠ 聚宽分批获取失败: {e}，回退到缓存逐个读取（可能较慢）")
+            ret_3d_map = None
+            direction_map = None
+    else:
+        ret_3d_map = None
+        direction_map = None
+
+    # 若聚宽不可用，ret_3d_map 可能为 None，后续按需回退到 _read_stock_3d_ret
     boards_to_remove = []
     for board_name, board_info in board_candidate_pool.items():
         constituent_codes = board_info["成分股代码集"]
@@ -1692,56 +1803,88 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
             boards_to_remove.append(board_name)
             continue
 
-        # 限制采样数量
-        sample_codes = codes[:MAX_SAMPLE]
-
-        # ----- 计算每只样本股近3日涨幅，备用 -----
+        # ---- 获取板块内市值前10的股票（若无法获取市值则用涨幅前10） ----
         stock_ret_list = []  # (code, ret)
-        for code in sample_codes:
-            ret = _read_stock_3d_ret(code, eval_date=date_str)
-            if ret is not None:
-                stock_ret_list.append((code, ret))
-        # ----- 计算板块近3日涨幅：优先以流通市值前10的涨幅中位数 -----
-        if stock_ret_list:
-            # 获取样本股市值
-            code_mcaps = {}
-            for code in sample_codes:
-                mcap = _get_stock_market_cap(code, date_str)
-                if mcap is not None and mcap > 0:
-                    code_mcaps[code] = mcap
-            if len(code_mcaps) >= 10:
-                top_codes = sorted(code_mcaps, key=code_mcaps.get, reverse=True)[:10]
-                top_ret_list = [r for c, r in stock_ret_list if c in top_codes]
-                ret_3d = float(np.median(top_ret_list)) if top_ret_list else -999.0
-            else:
-                # 市值数据不足，回退至涨幅前10
+        code_mcaps = {}
+        # 优先使用聚宽预加载结果
+        if ret_3d_map is not None:
+            for code in codes:
+                ret = ret_3d_map.get(code)
+                if ret is not None:
+                    stock_ret_list.append((code, ret))
+        else:
+            # 回退到逐个缓存读取（尽量避免网络请求）
+            for code in codes:
+                ret = _read_stock_3d_ret(code, eval_date=date_str)
+                if ret is not None:
+                    stock_ret_list.append((code, ret))
+
+        # 市值获取（暂时保留原样，但可以跳过大量失效请求，因为我们已经知道涨幅数据）
+        # 注意：这里仍然会逐只请求市值，但总数已由聚宽约束为有效涨幅股
+        for code, _ in stock_ret_list:
+            mcap = _get_stock_market_cap(code, date_str)
+            if mcap is not None and mcap > 0:
+                code_mcaps[code] = mcap
+
+        if not stock_ret_list:
+            ret_3d = -999.0
+            board_info["近3日涨幅"] = ret_3d
+            boards_to_remove.append(board_name)
+            continue
+
+        # 确定用于计算的样本（最多10只）
+        if len(code_mcaps) >= 10:
+            top_codes = sorted(code_mcaps, key=code_mcaps.get, reverse=True)[:10]
+            sample = [c for c, r in stock_ret_list if c in top_codes]
+            if len(sample) < 10:
                 stock_ret_list.sort(key=lambda x: x[1], reverse=True)
-                top_n = min(10, len(stock_ret_list))
-                top_rets = [x[1] for x in stock_ret_list[:top_n]]
-                ret_3d = float(np.median(top_rets))
+                for c, _ in stock_ret_list:
+                    if c not in sample:
+                        sample.append(c)
+                    if len(sample) >= 10:
+                        break
+        else:
+            stock_ret_list.sort(key=lambda x: x[1], reverse=True)
+            sample = [c for c, _ in stock_ret_list[:10]]
+
+        if not sample:
+            ret_3d = -999.0
+            board_info["近3日涨幅"] = ret_3d
+            boards_to_remove.append(board_name)
+            continue
+
+        # ---- 计算板块近3日涨幅：采样样本的近3日涨幅中位数 ----
+        sample_rets = []
+        for code in sample:
+            match = [r for c, r in stock_ret_list if c == code]
+            if match:
+                sample_rets.append(match[0])
+            else:
+                # 兜底
+                ret = ret_3d_map.get(code) if ret_3d_map else _read_stock_3d_ret(code, eval_date=date_str)
+                if ret is not None:
+                    sample_rets.append(ret)
+        if sample_rets:
+            ret_3d = float(np.median(sample_rets))
         else:
             ret_3d = -999.0
         board_info["近3日涨幅"] = ret_3d
 
-        # ----- 计算上涨家数占比（优先使用聚宽方向数据，样本股 = 所有有效成分股） -----
+        # ---- 计算上涨家数占比（基于样本股，优先使用聚宽预加载的方向） ----
         up_ratios = []
-        # 使用全部有效成分股代码（限制数量以提高速度，最多200只）
-        all_valid_codes = [c for c in constituent_codes if c[:2] in ('60', '00', '30')][:200]
         for day_str in recent_3_dates:
             up_count = 0
             total = 0
-            for code in all_valid_codes:
-                # 优先从聚宽方向缓存中获取
-                up = jq_stock_directions.get(code, {}).get(day_str)
-                if up is not None:
-                    if up == 1:
+            for code in sample:
+                if direction_map and code in direction_map:
+                    dir_val = direction_map[code].get(day_str, 0)
+                    if dir_val == 1:
                         up_count += 1
                     total += 1
                 else:
-                    # 回退到本地缓存
+                    # 回退本地缓存
                     cache_file = os.path.join(DAILY_CACHE_DIR, f"{code}.csv")
                     if not os.path.exists(cache_file):
-                        # 缺失则补拉
                         start_pull = (pd.to_datetime(day_str) - pd.Timedelta(days=20)).strftime("%Y%m%d")
                         fetch_stock_daily(code, start_pull, day_str)
                     if not os.path.exists(cache_file):
@@ -1795,7 +1938,6 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
         # ----- 上涨家数占比过滤（动态阈值 + 涨停家数兜底） -----
         avg_limit = board_info.get("日均涨停家数", 0)
         if avg_up_ratio < threshold_up_ratio:
-            # 兜底条件：板块日均涨停家数 >= 3，即使占比低也保留
             if avg_limit >= 3:
                 print(f"    💡 {board_name} 上涨家数占比 {avg_up_ratio:.1%} < {threshold_up_ratio:.0%}，但日均涨停 {avg_limit:.1f} ≥ 3，兜底保留")
             else:
@@ -1819,9 +1961,9 @@ def screen_main_sectors(eval_date: str) -> List[Dict]:
         print("  ❌ 无板块有有效涨幅数据")
         return []
 
-    top_n = max(1, int(len(board_returns_list) * CONFIG.board_return_top_pct))
+    top_n = max(1, math.ceil(len(board_returns_list) * CONFIG.board_return_top_pct))
     top_threshold = board_returns_list[min(top_n, len(board_returns_list)) - 1][1]
-    print(f"  前40%涨幅阈值: {top_threshold:.4f}（有效板块{len(board_returns_list)}个，前{top_n}个）")
+    print(f"  前{CONFIG.board_return_top_pct:.0%}涨幅阈值: {top_threshold:.4f}（有效板块{len(board_returns_list)}个，前{top_n}个）")
 
     # 板块涨幅排名分（百分位：最高100，最低0）
     N_boards = len(board_returns_list)
@@ -2745,16 +2887,11 @@ def daily_identify(eval_date: Optional[str] = None) -> List[Dict]:
 
     # ========================== 主线板块（整合两条路径，去重保留最高优先级） ==========================
     leader_sectors = screen_main_sectors(eval_date)   # 龙头路径（含 S/A 级）
-    trend_sectors = screen_trend_sectors(eval_date)   # 趋势路径（B 级）
+    # 趋势路径因性能与准确性暂不启用（需完全重构：批量预取板块指数，避免逐个成分股计算上涨家数占比）
+    # trend_sectors = screen_trend_sectors(eval_date)
 
-    # 按板块名称去重，保留最高优先级（S > A > B）
-    priority_order = {"S": 3, "A": 2, "B": 1}
-    merged = {}
-    for s in leader_sectors + trend_sectors:
-        name = s["板块名称"]
-        if name not in merged or priority_order.get(s.get("priority", "B"), 0) > priority_order.get(merged[name].get("priority", "B"), 0):
-            merged[name] = s
-    main_sectors = list(merged.values())
+    # 目前仅使用龙头路径
+    main_sectors = leader_sectors
 
     if not main_sectors:
         print("\n⚠ 无主线板块，识别结束")
@@ -3022,13 +3159,16 @@ if __name__ == "__main__":
             print("❌ Tushare 初始化失败，请检查 token 或安装 tushare")
     else:
         print("⚠ 未设置 Tushare token，将使用爬虫（速度慢）")
-    # ---- 首次或按需重建概念缓存（需使用聚宽试用期内的日期） ----
+    # # ---- 首次或按需重建概念缓存和行业缓存 ----
     # print("\n===== 开始构建概念缓存 =====")
+    # build_stock_concept_index(force_refresh=True)  # 强制重建，应用宽基过滤
+    # print("\n✅ 概念缓存写入/加载完成")
 
-    # build_stock_concept_index(force_refresh=True)      # 以 2026-04-24 为基准
-    # print("\n✅ 概念缓存写入完成")
+    # print("\n===== 开始构建行业缓存 =====")
+    # build_industry_index_sw()  # 首次或缓存过期自动刷新
+    # print("\n✅ 行业缓存写入/加载完成")
 
-    # 运行策略（使用真实历史日期，确保行情数据可获取）
-    result = daily_identify("2025-08-24")
+    #运行策略（使用真实历史日期，确保行情数据可获取）
+    result = daily_identify("2026-03-25")
 
 
